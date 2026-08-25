@@ -203,11 +203,6 @@ export class GraphScene {
     const now = Date.now() / 1000;
     const fadeSeconds = this.theme.kanbanFadeHours * 3600;
     this.nodes = snapshot.nodes.filter((node) => {
-      if (node.kind === "result") {
-        const createdAt = Number(node.metadata?.createdAt || 0);
-        const ttlSeconds = Number(node.metadata?.ttlSeconds || 30);
-        if (createdAt && now - createdAt >= ttlSeconds) return false;
-      }
       if (node.kind !== "task" || node.status !== "done") return true;
       const completedAt = Number(node.metadata?.completedAt || 0);
       return !completedAt || now - completedAt < fadeSeconds;
@@ -463,16 +458,9 @@ export class GraphScene {
         if (!JUMP_EDGE_KINDS.has(edge.kind)) return false;
         const source = byId.get(edge.source);
         const target = byId.get(edge.target);
-        const createdAt = Number(edge.metadata?.createdAt ?? 0);
-        const ttlSeconds = Number(
-          edge.metadata?.ttlSeconds ?? this.theme.activityTtlSeconds,
-        );
-        const recentlyCreated =
-          createdAt > 0 && Date.now() / 1000 - createdAt <= ttlSeconds;
-        return (
-          Boolean(source) &&
-          (source?.status === "active" || target?.status === "active" || recentlyCreated || createdAt === 0)
-        );
+        // Expiry is authoritative in the SQLite projection. This filter only
+        // guards malformed snapshots; route animation itself is presentation.
+        return Boolean(source) && Boolean(target);
       })
       .slice(0, 20);
     const sceneNow = this.clock.elapsedTime;

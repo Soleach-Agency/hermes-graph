@@ -257,7 +257,93 @@ def upsert_edge(
         )
 
 
+_DELETE_EVENT_NAMESPACE = uuid.UUID("2f7d4bd2-9b6a-4c73-9a53-4f4f9f4c5ad3")
+
+
+def _expiry(metadata_json: str, now: float) -> bool:
+    try:
+        metadata = json.loads(metadata_json)
+        created_at = float(metadata.get("createdAt"))
+        ttl_seconds = float(metadata.get("ttlSeconds"))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return ttl_seconds >= 0 and created_at + ttl_seconds <= now
+
+
+def _delete_event_id(event_type: str, entity_id: str, created_at: float) -> str:
+    return str(uuid.uuid5(_DELETE_EVENT_NAMESPACE, f"{event_type}:{entity_id}:{created_at!r}"))
+
+
+def cleanup_expired(now: float | None = None) -> dict[str, list[str]]:
+    """Remove expired transient projection rows and append replayable deletes.
+
+    The transaction takes the SQLite writer lock, making concurrent cleanup and
+    hook activity serialize. Delete events are deterministic for one entity
+    lifecycle, so retries after a crash cannot duplicate history.
+    """
+    now = utc_timestamp() if now is None else float(now)
+    with connect() as conn:
+        expired_nodes = [
+            row for row in conn.execute(
+                "SELECT id, created_at, metadata_json FROM nodes WHERE kind = 'result'"
+            ) if _expiry(row["metadata_json"], now)
+        ]
+        expired_node_ids = {row["id"] for row in expired_nodes}
+        temporary_edges = list(conn.execute(
+            """
+            SELECT id, source_id, target_id, created_at, metadata_json
+            FROM edges
+            WHERE kind IN ('called', 'retrieved', 'returned')
+            """
+        ))
+        live_node_ids = {
+            row["id"] for row in conn.execute("SELECT id FROM nodes")
+        }
+        expired_edges = [
+            row for row in temporary_edges
+            if _expiry(row["metadata_json"], now)
+            or row["source_id"] in expired_node_ids
+            or row["target_id"] in expired_node_ids
+            or row["source_id"] not in live_node_ids
+            or row["target_id"] not in live_node_ids
+        ]
+        expired_edge_ids = {row["id"] for row in expired_edges}
+
+        # Edges are removed first so the live projection never contains a
+        # dangling reference, including during result-node expiry.
+        if expired_edge_ids:
+            conn.executemany("DELETE FROM edges WHERE id = ?", [(item,) for item in expired_edge_ids])
+        if expired_node_ids:
+            conn.executemany("DELETE FROM nodes WHERE id = ?", [(item,) for item in expired_node_ids])
+
+        event_rows: list[tuple[str, str, float, str, None, str]] = []
+        for row in sorted(expired_edges, key=lambda item: item["id"]):
+            event_rows.append((
+                _delete_event_id("scene.edge_delete", row["id"], float(row["created_at"])),
+                "scene.edge_delete", now, "projection", None, _json({"id": row["id"]}),
+            ))
+        for row in sorted(expired_nodes, key=lambda item: item["id"]):
+            event_rows.append((
+                _delete_event_id("scene.node_delete", row["id"], float(row["created_at"])),
+                "scene.node_delete", now, "projection", None, _json({"id": row["id"]}),
+            ))
+        if event_rows:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO events(
+                    event_id, event_type, occurred_at, source, session_id, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                event_rows,
+            )
+        return {
+            "nodes": sorted(expired_node_ids),
+            "edges": sorted(expired_edge_ids),
+        }
+
+
 def get_snapshot() -> dict[str, Any]:
+    cleanup_expired()
     with connect() as conn:
         cursor_row = conn.execute(
             "SELECT COALESCE(MAX(sequence), 0) AS cursor FROM events"

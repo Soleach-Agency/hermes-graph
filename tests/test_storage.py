@@ -93,6 +93,109 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(maximum["startCursor"], max(0, first - 1))
         self.assertEqual(maximum["endCursor"], last)
 
+    def test_cleanup_expired_removes_transient_entities_and_records_deletes(self):
+        with patch.object(storage, "utc_timestamp", return_value=100.0):
+            storage.upsert_node("agent:1", "agent", "Agent")
+            storage.record_event("scene.node_upsert", {"node": {
+                "id": "agent:1", "kind": "agent", "label": "Agent",
+                "status": "observed", "color": None, "size": None,
+                "pressure": None, "metadata": {},
+            }}, source="projection")
+            storage.upsert_node(
+                "result:1", "result", "Result",
+                metadata={"createdAt": 90.0, "ttlSeconds": 10},
+            )
+            storage.record_event("scene.node_upsert", {"node": {
+                "id": "result:1", "kind": "result", "label": "Result",
+                "status": "observed", "color": None, "size": None,
+                "pressure": None, "metadata": {"createdAt": 90.0, "ttlSeconds": 10},
+            }}, source="projection")
+            storage.upsert_node(
+                "note:1", "note", "Persistent",
+                metadata={"createdAt": 90.0, "ttlSeconds": 10},
+            )
+            storage.record_event("scene.node_upsert", {"node": {
+                "id": "note:1", "kind": "note", "label": "Persistent",
+                "status": "observed", "color": None, "size": None,
+                "pressure": None, "metadata": {"createdAt": 90.0, "ttlSeconds": 10},
+            }}, source="projection")
+            storage.upsert_edge(
+                "returned:1", "agent:1", "result:1", "returned",
+                metadata={"createdAt": 90.0, "ttlSeconds": 10},
+            )
+            storage.record_event("scene.edge_upsert", {"edge": {
+                "id": "returned:1", "source": "agent:1", "target": "result:1",
+                "kind": "returned", "active": True,
+                "metadata": {"createdAt": 90.0, "ttlSeconds": 10},
+            }}, source="projection")
+            storage.upsert_edge(
+                "belongs:1", "agent:1", "note:1", "belongs_to",
+            )
+            storage.record_event("scene.edge_upsert", {"edge": {
+                "id": "belongs:1", "source": "agent:1", "target": "note:1",
+                "kind": "belongs_to", "active": True, "metadata": {},
+            }}, source="projection")
+
+        with patch.object(storage, "utc_timestamp", return_value=99.999):
+            before = storage.get_snapshot()
+        before_cursor = before["cursor"]
+        removed = storage.cleanup_expired(now=99.999)
+        self.assertEqual(removed, {"nodes": [], "edges": []})
+
+        removed = storage.cleanup_expired(now=100.0)
+        self.assertEqual(removed, {"nodes": ["result:1"], "edges": ["returned:1"]})
+        after = storage.get_snapshot()
+        self.assertEqual({node["id"] for node in after["nodes"]}, {"agent:1", "note:1"})
+        self.assertEqual([edge["id"] for edge in after["edges"]], ["belongs:1"])
+        self.assertEqual(
+            [event["type"] for event in storage.get_events(before_cursor)],
+            ["scene.edge_delete", "scene.node_delete"],
+        )
+        self.assertEqual(storage.cleanup_expired(now=100.0), {"nodes": [], "edges": []})
+        historical_before = storage.get_snapshot_at(before_cursor)
+        historical_after = storage.get_snapshot_at(after["cursor"])
+        self.assertEqual(len(historical_before["nodes"]), 3)
+        self.assertEqual(len(historical_before["edges"]), 2)
+        self.assertEqual(len(historical_after["nodes"]), 2)
+        self.assertEqual([edge["id"] for edge in historical_after["edges"]], ["belongs:1"])
+
+    def test_cleanup_expired_removes_orphaned_temporary_edges(self):
+        storage.upsert_edge(
+            "called:orphan", "missing", "tool", "called",
+            metadata={"createdAt": 10.0, "ttlSeconds": 1},
+        )
+        storage.upsert_edge(
+            "retrieved:orphan", "tool", "missing", "retrieved",
+            metadata={"createdAt": 10.0, "ttlSeconds": 1},
+        )
+
+        self.assertEqual(
+            storage.cleanup_expired(now=11.0),
+            {"nodes": [], "edges": ["called:orphan", "retrieved:orphan"]},
+        )
+        self.assertEqual(storage.get_snapshot()["edges"], [])
+
+    def test_cleanup_expired_covers_every_temporary_edge_kind(self):
+        for node_id in ("agent:1", "tool:1", "note:1", "result:1"):
+            kind = "result" if node_id == "result:1" else "agent"
+            metadata = {"createdAt": 10.0, "ttlSeconds": 1} if kind == "result" else {}
+            storage.upsert_node(node_id, kind, node_id, metadata=metadata)
+        for kind, source, target in (
+            ("called", "agent:1", "tool:1"),
+            ("retrieved", "tool:1", "note:1"),
+            ("returned", "tool:1", "result:1"),
+        ):
+            storage.upsert_edge(
+                f"{kind}:1", source, target, kind,
+                metadata={"createdAt": 10.0, "ttlSeconds": 1},
+            )
+
+        removed = storage.cleanup_expired(now=11.0)
+        self.assertEqual(
+            removed["edges"], ["called:1", "retrieved:1", "returned:1"]
+        )
+        self.assertEqual(removed["nodes"], ["result:1"])
+
 
 class ProfileStoragePathTests(unittest.TestCase):
     def test_profile_home_resolves_to_shared_machine_database(self):
