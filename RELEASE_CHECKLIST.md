@@ -1,16 +1,17 @@
 # Hermes Graph 0.1.0 release checklist
 
-This is a release-candidate record, not a publication claim. The repository target
-visible in the checkout is `Soleach-Agency/hermes-graph`. No license choice or
-publication authorization was supplied for this run, so no LICENSE file, tag,
-GitHub release, or public install claim is created here.
+This is the release-candidate record for `Soleach-Agency/hermes-graph`. The owner
+selected the MIT License and authorized publication on 2026-08-25. Publication
+still waits for the integrated candidate to pass the live-host deployment and
+compatibility checks below; authorization is not treated as evidence that those
+checks passed.
 
 ## Package checks
 
 | Check | Command | Result |
 | --- | --- | --- |
 | Native package doctor | `hermes plugins doctor . --ci` | PASS — Hermes 0.20.5; runtime discovery, manifest parsing, import, registration; 14 hooks |
-| Backend tests | `python3 -m unittest discover -s tests -v` | PASS — 18 tests |
+| Backend tests | `python3 -m unittest discover -s tests -v` | PASS — 36 tests after dependency integration |
 | Locked frontend install | `cd dashboard && npm ci` | PASS — 115 packages added; 0 vulnerabilities |
 | Frontend tests | `cd dashboard && npm test -- --run` | PASS — 1 file, 1 test |
 | Frontend build | `cd dashboard && npm run build` | PASS — TypeScript check and Vite build |
@@ -27,25 +28,24 @@ worktree. `UNVERIFIED` is intentionally not a pass.
 | --- | --- | --- |
 | Supported Hermes version | `hermes --version` | PASS — Hermes Agent v0.20.5 |
 | All declared hooks agree with registrations | `hermes plugins doctor . --ci`; `tests/test_plugin_package.py` | PASS — 14 declared and registered hooks |
-| CLI event capture | Real CLI exercise on a host with the plugin enabled | UNVERIFIED in this isolated worktree; no live host capture was repeated |
+| CLI event capture | Real Luna CLI exercise on the Soleach host | PASS for the pre-integration plugin — session `20260825_163254_871a9e`; repeat after candidate deployment remains required |
 | Gateway/worker event capture | Gateway and Kanban-worker smoke run | UNVERIFIED — no gateway/worker host was available |
-| Shared multi-profile store | `tests/test_storage.py::ProfileStoragePathTests::test_profile_home_resolves_to_shared_machine_database` | PASS — path contract; live multi-profile process run remains UNVERIFIED |
+| Shared multi-profile store | Path contract plus real Luna/default Dashboard event store | PASS — all configured profiles resolve to `/root/.hermes/plugin-data/hermes-graph/events.sqlite3` |
 | Cold startup and snapshot cursor | `tests/test_storage.py` snapshot/cursor tests | PASS — deterministic local contract; cold real-host restart remains UNVERIFIED |
 | Reconnect behavior | Dashboard WebSocket reconnect smoke run | UNVERIFIED — no authenticated remote host was available |
-| Kanban hydration | Durable Kanban fixture and hydration test from the completed dependency card | UNVERIFIED in this checkout — hydration implementation is not present in the release branch |
-| Vault watcher recovery | Vault unavailable/missed-event recovery smoke run | UNVERIFIED in this checkout — no watcher implementation is present in the release branch |
-| TTL cleanup/replay | Expiry, delete-event, and replay tests from the completed dependency card | UNVERIFIED in this checkout — cleanup implementation is not present in the release branch |
-| Authenticated remote Dashboard | Authenticated remote Dashboard + API/WebSocket smoke run | UNVERIFIED — no remote authenticated host was available |
-| 10k visual smoke path | Dashboard deterministic `PERF` scene | UNVERIFIED — browser/GPU capture not available in this run |
-| 25k visual smoke path | Dashboard deterministic `PERF` scene | UNVERIFIED — browser/GPU capture not available in this run |
-| 50k visual smoke path | Dashboard deterministic `PERF` scene | UNVERIFIED — browser/GPU capture not available in this run |
+| Kanban hydration | `tests/test_kanban_hydration.py`; startup registration test | PASS — five deterministic tests plus combined startup test |
+| Vault watcher recovery | `tests/test_vault.py` incremental edit/rename/create/delete and recovery tests | PASS — watcher and recovery paths integrated |
+| TTL cleanup/replay | `tests/test_storage.py` cleanup/delete/replay tests | PASS — temporary nodes and all temporary edge kinds covered |
+| Authenticated remote Dashboard | Authenticated Dashboard discovery, snapshot, Vault, and asset smoke run | PASS for the pre-integration plugin; repeat after candidate deployment remains required |
+| 10k visual smoke path | Dashboard deterministic `PERF` scene | PASS in the local in-app-browser visual pass |
+| 25k visual smoke path | Dashboard deterministic `PERF` scene | PASS in the local in-app-browser visual pass |
+| 50k visual smoke path | Dashboard deterministic `PERF` scene | PASS — settled at the development display's 120 FPS ceiling; hardware-specific, not a universal guarantee |
 
 ## Release gate
 
-- [ ] Owner chooses and records an explicit repository license.
-- [ ] Owner authorizes publication of `Soleach-Agency/hermes-graph`.
-- [ ] Dependency implementations are integrated into this release branch and the
-  affected checks above are rerun.
+- [x] Owner chose and recorded the MIT License.
+- [x] Owner authorized publication of `Soleach-Agency/hermes-graph`.
+- [x] Dependency implementations are integrated and affected local checks rerun.
 - [ ] An operator with the required host access reruns every `UNVERIFIED` cell and
   records the verbatim command/result without converting unavailable cells to pass.
 - [ ] Only after the previous items are complete: create the repository release and

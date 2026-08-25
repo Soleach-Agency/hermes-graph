@@ -15,10 +15,13 @@ Vault, and captured a Luna CLI session plus terminal tool call in the shared sto
 Gateway/Kanban-worker event coverage and remote reconnect behavior remain explicit
 compatibility-matrix checks; an unavailable host is not a passing result.
 
-The release candidate has a complete native plugin entry point, matching hook
-manifest, authenticated Dashboard API declaration, and pre-built Dashboard bundle.
-The remaining release gate is recorded in `RELEASE_CHECKLIST.md`: owner selection
-of a license, publication authorization, and any unavailable compatibility cells.
+The integrated release candidate includes incremental Vault synchronization,
+existing runtime/session hydration, durable Kanban topology, replay-preserving
+transient cleanup, a complete native plugin entry point, matching hook manifest,
+authenticated Dashboard API declaration, and the pre-built Dashboard bundle. The
+owner selected MIT and authorized publication. The remaining release gate in
+`RELEASE_CHECKLIST.md` is live-host deployment plus the unavailable compatibility
+cells; publication happens only after that evidence is recorded.
 
 ## Post-release data fidelity
 
