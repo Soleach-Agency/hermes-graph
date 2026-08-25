@@ -256,6 +256,13 @@ def configure_vault(path_value: str | Path) -> dict[str, object]:
     global _WATCHER
     result = index_vault(path_value)
     root = Path(result["path"])
+    _start_vault_watcher(root)
+    return {**result, "watching": bool(_WATCHER and _WATCHER.running)}
+
+
+def _start_vault_watcher(root: Path) -> None:
+    """Keep exactly one watcher alive for the selected resolved Vault root."""
+    global _WATCHER
     with _WATCHER_LOCK:
         if _WATCHER and _WATCHER.root != root:
             _WATCHER.stop()
@@ -263,7 +270,19 @@ def configure_vault(path_value: str | Path) -> dict[str, object]:
         if _WATCHER is None:
             _WATCHER = VaultWatcher(root)
             _WATCHER.start()
-    return {**result, "watching": bool(_WATCHER and _WATCHER.running)}
+
+
+def resume_configured_vault_watcher() -> bool:
+    """Recover missed changes and resume the persisted Vault after Dashboard restart."""
+    path = get_setting("vault_path")
+    if not path:
+        return False
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        return False
+    reconcile_vault(root)
+    _start_vault_watcher(root)
+    return bool(_WATCHER and _WATCHER.running)
 
 
 def stop_vault_watcher() -> None:

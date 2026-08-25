@@ -7,7 +7,15 @@ from unittest.mock import patch
 
 import hermes_graph.storage as storage
 from hermes_graph.hooks import make_observer
-from hermes_graph.vault import VaultWatcher, index_vault, reconcile_vault, sync_vault_change
+from hermes_graph.vault import (
+    VaultWatcher,
+    index_vault,
+    reconcile_vault,
+    resume_configured_vault_watcher,
+    stop_vault_watcher,
+    sync_vault_change,
+    vault_status,
+)
 
 
 class VaultIndexTests(unittest.TestCase):
@@ -21,6 +29,7 @@ class VaultIndexTests(unittest.TestCase):
         self.path_patch.start()
 
     def tearDown(self):
+        stop_vault_watcher()
         self.path_patch.stop()
         self.temp_dir.cleanup()
 
@@ -140,6 +149,17 @@ class VaultIndexTests(unittest.TestCase):
         alpha.unlink()
         self.assertTrue(watcher.poll_once())
         self.assertEqual(storage.get_vault_counts(), (0, 0))
+
+    def test_persisted_vault_reconciles_and_resumes_watching_after_restart(self):
+        alpha = self.vault / "Alpha.md"
+        alpha.write_text("# Alpha")
+        index_vault(self.vault)
+        beta = self.vault / "Beta.md"
+        beta.write_text("# Beta")
+
+        self.assertTrue(resume_configured_vault_watcher())
+        self.assertTrue(vault_status()["watching"])
+        self.assertEqual(storage.get_vault_counts(), (2, 0))
 
 
 if __name__ == "__main__":
