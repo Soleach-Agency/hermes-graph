@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -534,6 +535,88 @@ def get_vault_counts() -> tuple[int, int]:
             "SELECT COUNT(*) AS count FROM edges WHERE id LIKE 'wikilink:%' AND active = 1"
         ).fetchone()
     return int(notes["count"]), int(links["count"])
+
+
+def get_vault_document(path: str) -> dict[str, Any] | None:
+    """Return projection metadata only; Markdown bodies are never persisted."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM vault_documents WHERE path = ?", (path,)).fetchone()
+    if not row:
+        return None
+    return {
+        "path": row["path"], "id": row["node_id"], "label": row["title"],
+        "links": json.loads(row["links_json"]), "mtime_ns": int(row["mtime_ns"]),
+    }
+
+
+def apply_vault_delta(
+    vault_path: str, documents: list[dict[str, Any]], edges: list[dict[str, Any]], *,
+    remove_paths: list[str] | None = None, replace_edge_sources: list[str] | None = None,
+) -> bool:
+    """Atomically apply changed vault documents and their wikilink edges only."""
+    now = utc_timestamp()
+    changed = False
+    remove_paths = remove_paths or []
+    replace_edge_sources = replace_edge_sources or []
+    with connect() as conn:
+        removed_ids = [
+            row["node_id"] for path in remove_paths
+            for row in conn.execute("SELECT node_id FROM vault_documents WHERE path = ?", (path,))
+        ]
+        stale_edges = {
+            row["id"] for node_id in set(removed_ids + replace_edge_sources)
+            for row in conn.execute(
+                "SELECT id FROM edges WHERE id LIKE 'wikilink:%' AND (source_id = ? OR target_id = ?)",
+                (node_id, node_id),
+            )
+        }
+        existing_docs = {
+            row["path"]: row for row in conn.execute(
+                "SELECT path, node_id, title, links_json, mtime_ns FROM vault_documents"
+            )
+        }
+        next_edges = {edge["id"]: edge for edge in edges}
+        existing_edges = {
+            row["id"]: row for row in conn.execute(
+                "SELECT id, source_id, target_id, metadata_json FROM edges WHERE id LIKE 'wikilink:%'"
+            )
+        }
+        for path in remove_paths:
+            row = existing_docs.get(path)
+            if row:
+                conn.execute("DELETE FROM vault_documents WHERE path = ?", (path,))
+                conn.execute("DELETE FROM nodes WHERE id = ?", (row["node_id"],))
+                changed = True
+                event_id = hashlib.sha1(f"vault:delete:{row['node_id']}".encode()).hexdigest()
+                conn.execute("INSERT OR IGNORE INTO events(event_id,event_type,occurred_at,source,session_id,payload_json) VALUES(?,?,?,?,?,?)", (event_id, "scene.node_delete", now, "vault", None, _json({"id": row["node_id"]})))
+        for document in documents:
+            prior = existing_docs.get(document["metadata"]["path"])
+            semantic = (document["id"], document["label"], document["metadata"], document.get("links", []), document["mtime_ns"])
+            previous = None if not prior else (prior["node_id"], prior["title"], json.loads(prior["links_json"]), int(prior["mtime_ns"]))
+            if previous and previous == (semantic[0], semantic[1], semantic[3], semantic[4]):
+                continue
+            changed = True
+            conn.execute("INSERT INTO nodes(id,kind,label,status,metadata_json,created_at,updated_at) VALUES(?, 'note', ?, 'observed', ?, ?, ?) ON CONFLICT(id) DO UPDATE SET label=excluded.label, metadata_json=excluded.metadata_json, updated_at=excluded.updated_at", (document["id"], document["label"], _json(document["metadata"]), now, now))
+            conn.execute("INSERT INTO vault_documents(path,node_id,title,links_json,mtime_ns,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET node_id=excluded.node_id,title=excluded.title,links_json=excluded.links_json,mtime_ns=excluded.mtime_ns,updated_at=excluded.updated_at", (document["metadata"]["path"], document["id"], document["label"], _json(document.get("links", [])), document["mtime_ns"], now))
+            node = {"id": document["id"], "kind": "note", "label": document["label"], "status": "observed", "color": None, "size": None, "pressure": None, "metadata": document["metadata"]}
+            event_id = hashlib.sha1(f"vault:upsert:{_json(node)}".encode()).hexdigest()
+            conn.execute("INSERT OR IGNORE INTO events(event_id,event_type,occurred_at,source,session_id,payload_json) VALUES(?,?,?,?,?,?)", (event_id, "scene.node_upsert", now, "vault", None, _json({"node": node})))
+        for edge_id in stale_edges:
+            conn.execute("DELETE FROM edges WHERE id = ?", (edge_id,))
+            changed = True
+            event_id = hashlib.sha1(f"vault:edge-delete:{edge_id}".encode()).hexdigest()
+            conn.execute("INSERT OR IGNORE INTO events(event_id,event_type,occurred_at,source,session_id,payload_json) VALUES(?,?,?,?,?,?)", (event_id, "scene.edge_delete", now, "vault", None, _json({"id": edge_id})))
+        for edge in next_edges.values():
+            projected = {**edge, "kind": "references", "active": True}
+            previous = existing_edges.get(edge["id"])
+            if previous and previous["source_id"] == edge["source"] and previous["target_id"] == edge["target"]:
+                continue
+            changed = True
+            conn.execute("INSERT INTO edges(id,source_id,target_id,kind,active,metadata_json,created_at,updated_at) VALUES(?,?,?,'references',1,?,?,?) ON CONFLICT(id) DO UPDATE SET source_id=excluded.source_id,target_id=excluded.target_id,active=1,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at", (edge["id"], edge["source"], edge["target"], _json(edge["metadata"]), now, now))
+            event_id = hashlib.sha1(f"vault:edge-upsert:{_json(projected)}".encode()).hexdigest()
+            conn.execute("INSERT OR IGNORE INTO events(event_id,event_type,occurred_at,source,session_id,payload_json) VALUES(?,?,?,?,?,?)", (event_id, "scene.edge_upsert", now, "vault", None, _json({"edge": projected})))
+        conn.execute("INSERT INTO settings(key,value_json,updated_at) VALUES('vault_path',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (_json(vault_path), now))
+    return changed
 
 
 def resolve_vault_node_ids(references: list[str]) -> list[str]:
