@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PLUGIN_ID = "hermes-graph"
 _SCHEMA_LOCK = threading.Lock()
 _INITIALIZED_PATHS: set[Path] = set()
@@ -130,6 +130,15 @@ def ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
                 links_json TEXT NOT NULL DEFAULT '[]',
                 mtime_ns INTEGER NOT NULL,
                 updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_hydration_entities (
+                provenance TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                projected_at REAL NOT NULL,
+                created_by_hydration INTEGER NOT NULL,
+                PRIMARY KEY (provenance, entity_kind, entity_id)
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -644,6 +653,188 @@ def replace_vault_projection(
         for edge in edges:
             projected = {**edge, "kind": "references", "active": True}
             event_rows.append((str(uuid.uuid4()), "scene.edge_upsert", now, "vault", None, _json({"edge": projected})))
+        conn.executemany(
+            """
+            INSERT INTO events(event_id, event_type, occurred_at, source, session_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            event_rows,
+        )
+
+
+def replace_runtime_hydration_projection(
+    provenance: str,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    """Reconcile one bounded hydration source without erasing live-hook state.
+
+    The ownership ledger distinguishes entities first created by hydration from
+    matching ids that existed before it. A later live hook changes ``updated_at``;
+    stale hydration then drops only its ownership record and leaves that live
+    projection intact.
+    """
+    next_nodes = {node["id"]: node for node in nodes}
+    next_edges = {edge["id"]: edge for edge in edges}
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        event_rows: list[tuple[str, str, float, str, None, str]] = []
+
+        def sync_entity(entity_kind: str, entity: dict[str, Any]) -> None:
+            table = "nodes" if entity_kind == "node" else "edges"
+            entity_id = entity["id"]
+            existing = conn.execute(
+                f"SELECT * FROM {table} WHERE id = ?", (entity_id,)
+            ).fetchone()
+            ownership = conn.execute(
+                """
+                SELECT projected_at, created_by_hydration
+                FROM runtime_hydration_entities
+                WHERE provenance = ? AND entity_kind = ? AND entity_id = ?
+                """,
+                (provenance, entity_kind, entity_id),
+            ).fetchone()
+            now = utc_timestamp()
+            changed = False
+            created = existing is None
+            if entity_kind == "node":
+                values = (
+                    entity["kind"], entity["label"], entity["status"], entity.get("color"),
+                    entity.get("size"), entity.get("pressure"), _json(entity.get("metadata", {})),
+                )
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO nodes(
+                            id, kind, label, status, color, size, pressure,
+                            metadata_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (entity_id, *values, now, now),
+                    )
+                    changed = True
+                else:
+                    previous = (
+                        existing["kind"], existing["label"], existing["status"],
+                        existing["color"], existing["size"], existing["pressure"],
+                        existing["metadata_json"],
+                    )
+                    if previous != values:
+                        conn.execute(
+                            """
+                            UPDATE nodes SET kind = ?, label = ?, status = ?, color = ?,
+                                size = ?, pressure = ?, metadata_json = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (*values, now, entity_id),
+                        )
+                        changed = True
+            else:
+                values = (
+                    entity["source"], entity["target"], entity["kind"], int(entity.get("active", True)),
+                    _json(entity.get("metadata", {})),
+                )
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO edges(
+                            id, source_id, target_id, kind, active,
+                            metadata_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (entity_id, *values, now, now),
+                    )
+                    changed = True
+                else:
+                    previous = (
+                        existing["source_id"], existing["target_id"], existing["kind"],
+                        existing["active"], existing["metadata_json"],
+                    )
+                    if previous != values:
+                        conn.execute(
+                            """
+                            UPDATE edges SET source_id = ?, target_id = ?, kind = ?, active = ?,
+                                metadata_json = ?, updated_at = ? WHERE id = ?
+                            """,
+                            (*values, now, entity_id),
+                        )
+                        changed = True
+            projected_at = now if changed else float(existing["updated_at"])
+            created_by_hydration = int(
+                ownership["created_by_hydration"] if ownership is not None else created
+            )
+            conn.execute(
+                """
+                INSERT INTO runtime_hydration_entities(
+                    provenance, entity_kind, entity_id, projected_at, created_by_hydration
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provenance, entity_kind, entity_id) DO UPDATE SET
+                    projected_at = excluded.projected_at,
+                    created_by_hydration = excluded.created_by_hydration
+                """,
+                (provenance, entity_kind, entity_id, projected_at, created_by_hydration),
+            )
+            if changed:
+                event_rows.append(
+                    (
+                        str(uuid.uuid4()),
+                        f"scene.{entity_kind}_upsert",
+                        now,
+                        f"runtime_hydration:{provenance}",
+                        None,
+                        _json({entity_kind: entity}),
+                    )
+                )
+
+        for edge in next_edges.values():
+            sync_entity("edge", edge)
+        for node in next_nodes.values():
+            sync_entity("node", node)
+
+        def remove_stale(entity_kind: str, retained_ids: set[str]) -> None:
+            table = "nodes" if entity_kind == "node" else "edges"
+            owned = conn.execute(
+                """
+                SELECT entity_id, projected_at, created_by_hydration
+                FROM runtime_hydration_entities
+                WHERE provenance = ? AND entity_kind = ?
+                """,
+                (provenance, entity_kind),
+            ).fetchall()
+            for row in owned:
+                entity_id = str(row["entity_id"])
+                if entity_id in retained_ids:
+                    continue
+                current = conn.execute(
+                    f"SELECT updated_at FROM {table} WHERE id = ?", (entity_id,)
+                ).fetchone()
+                now = utc_timestamp()
+                if (
+                    current is not None
+                    and bool(row["created_by_hydration"])
+                    and float(current["updated_at"]) == float(row["projected_at"])
+                ):
+                    conn.execute(f"DELETE FROM {table} WHERE id = ?", (entity_id,))
+                    event_rows.append(
+                        (
+                            str(uuid.uuid4()),
+                            f"scene.{entity_kind}_delete",
+                            now,
+                            f"runtime_hydration:{provenance}",
+                            None,
+                            _json({"id": entity_id}),
+                        )
+                    )
+                conn.execute(
+                    """
+                    DELETE FROM runtime_hydration_entities
+                    WHERE provenance = ? AND entity_kind = ? AND entity_id = ?
+                    """,
+                    (provenance, entity_kind, entity_id),
+                )
+
+        remove_stale("edge", set(next_edges))
+        remove_stale("node", set(next_nodes))
         conn.executemany(
             """
             INSERT INTO events(event_id, event_type, occurred_at, source, session_id, payload_json)
