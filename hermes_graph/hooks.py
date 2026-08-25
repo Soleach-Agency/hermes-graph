@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 
 from .storage import (
+    cleanup_expired,
     record_event,
     resolve_vault_node_ids,
     upsert_edge as store_upsert_edge,
@@ -403,6 +404,9 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
 
 def make_observer(event_name: str, profile_name: str | None = None) -> Callable[..., None]:
     def observer(**kwargs: Any) -> None:
+        # Catch up missed TTL work on every local lifecycle callback. The
+        # snapshot endpoint also runs the same idempotent transaction.
+        cleanup_expired()
         payload = _clean(kwargs)
         if profile_name and not payload.get("profile_name"):
             payload["profile_name"] = profile_name
