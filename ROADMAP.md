@@ -30,7 +30,10 @@ generic extraction from nested MCP text envelopes. Community defaults contain
 no Soleach- or vendor-specific tool rules. Local verification currently covers
 40 backend tests, three frontend tests, and the production build. Live Soleach
 validation resolved three RAG result paths to three real Vault nodes and emitted
-three temporary `retrieved` edges.
+three temporary `retrieved` edges. All seven Soleach profile-local plugin copies
+carry the verified hotfix checksum; Dashboard and Gateway were active after the
+final restart without interrupting the independently scoped worker that was
+already running.
 
 ## Next data-fidelity work
 
@@ -44,8 +47,8 @@ three temporary `retrieved` edges.
   text labels without ever storing complete result bodies.
 - Validate the current candidate against additional supported Hermes versions;
   the real-host matrix is presently anchored to Hermes 0.20.5.
-- Merge, tag, and publish `0.2.0` after the final live profile rollout and visual
-  settings smoke pass are recorded.
+- Merge, tag, and publish `0.2.0` after an authenticated visual settings/fade
+  smoke pass is recorded.
 
 ## Deliberately later
 
