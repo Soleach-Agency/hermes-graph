@@ -16,11 +16,18 @@ The product scope lives in [`PROJECT_SCOPE.md`](PROJECT_SCOPE.md).
 - Configurable node-type and four-state Kanban colors.
 - Configurable agent context-pressure gradient, white to purple by default.
 - Agent nodes grow as context pressure rises.
-- Configurable 6–48 hour Done-card shrink/darken/fade lifecycle.
+- Configurable 6–48 hour completed runtime lifecycle: owned tools retire first,
+  then completed Kanban/session/agent stars shrink, darken, fade, and leave the
+  live projection while history remains replayable.
 - Semantic/direct and 15–150-hop beautiful vault retrieval animations.
 - Independent color/thickness controls for persistent links and jump links, plus configurable hop-by-hop target size/brightness pulses and smooth timeline interpolation.
 - Activity links exist only while their call/retrieval/return animation is active, then fade away without leaving a static duplicate.
 - External tool result materialization with short-lived result stars.
+- User-editable tool routing rules that can override name heuristics, classify a
+  tool as Vault-facing/external/local, and map a configured result field to real
+  Vault-note paths, including paths wrapped in MCP text envelopes.
+- Explicit server-side Save Settings persistence with a browser-local migration
+  fallback; community installations start with no vendor-specific tool rules.
 - Type-appropriate hover informant.
 - SQLite WAL event history shared across Hermes processes.
 - Current scene snapshot plus cursor-based live WebSocket stream.
@@ -28,7 +35,7 @@ The product scope lives in [`PROJECT_SCOPE.md`](PROJECT_SCOPE.md).
 - Playback windows for 1 hour, 6 hours, 1 day (default), 7 days, 30 days, or the complete retained history.
 - Built-in 10k, 25k, and 50k node performance scenes.
 
-Vault indexing is available from the viewer's **Settings** panel: enter the vault directory that is visible to the machine running Hermes, then choose **Connect / Refresh**. The plugin-owned watcher keeps Markdown creates, edits, renames, and deletes synchronized after configuration; **Connect / Refresh** remains the explicit recovery path when the vault was unavailable or events were missed. Kanban hydration is read-only and preserves task/dependency topology without copying card bodies or comments.
+Vault indexing is available from the viewer's **Settings** panel: enter the vault directory that is visible to the machine running Hermes, then choose **Connect / Refresh**. The plugin-owned watcher keeps Markdown creates, edits, renames, and deletes synchronized after configuration; **Connect / Refresh** remains the explicit recovery path when the vault was unavailable or events were missed. Tool routing overrides and visual preferences are saved from the same panel. Kanban hydration is read-only and preserves task/dependency topology without copying card bodies or comments.
 
 ## Plugin layout
 

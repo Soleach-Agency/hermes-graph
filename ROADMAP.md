@@ -6,7 +6,7 @@ observers, local history/API, and the pre-built Dashboard viewer ship together.
 On a multi-profile Hermes host, every enabled profile writes to the same
 machine-level SQLite WAL store; the source profile is retained on normalized events.
 
-## First-release status
+## Release status
 
 The first real-host pass was completed on 2026-08-25 against Hermes 0.20.5. The
 plugin passed `doctor --ci` with 14 hooks, was enabled for all seven profiles on
@@ -15,25 +15,37 @@ Vault, and captured a Luna CLI session plus terminal tool call in the shared sto
 Gateway/Kanban-worker event coverage and remote reconnect behavior remain explicit
 compatibility-matrix checks; an unavailable host is not a passing result.
 
-The integrated release candidate includes incremental Vault synchronization,
+The integrated first release includes incremental Vault synchronization,
 existing runtime/session hydration, durable Kanban topology, replay-preserving
 transient cleanup, a complete native plugin entry point, matching hook manifest,
-authenticated Dashboard API declaration, and the pre-built Dashboard bundle. The
-owner selected MIT and authorized publication. The remaining release gate in
-`RELEASE_CHECKLIST.md` is live-host deployment plus the unavailable compatibility
-cells; publication happens only after that evidence is recorded.
+authenticated Dashboard API declaration, and the pre-built Dashboard bundle.
+The owner selected MIT, published the repository, and released the portable
+Hermes 0.20.5-compatible `v0.1.1` package. The historical evidence is retained in
+`RELEASE_CHECKLIST.md` and `RELEASE_CHECKLIST_0.1.1.md`.
 
-## Post-release data fidelity
+The `0.2.0` candidate on `codex/lifecycle-settings` adds completed runtime
+retirement, owned-tool-first fade sequencing, persistent visual preferences,
+editable tool routing overrides, configurable Vault result-field mapping, and
+generic extraction from nested MCP text envelopes. Community defaults contain
+no Soleach- or vendor-specific tool rules. Local verification currently covers
+40 backend tests, three frontend tests, and the production build. Live Soleach
+validation resolved three RAG result paths to three real Vault nodes and emitted
+three temporary `retrieved` edges.
 
-- Replace heuristic tool direction classification with user-editable rules.
+## Next data-fidelity work
+
 - Add artifact nodes and provenance from the stable Hermes surfaces that expose
   them.
 - Add generated/self-improving skill nodes and connect them to their creator,
   session, artifacts, and later tool usage.
 - Use an authoritative model context limit so agent pressure is shown only when the
   ratio is trustworthy.
-- Expand tool result adapters for RAG/search plugins whose outputs do not use the
-  common `path`, `title`, `results`, or `matches` shapes.
+- Expand structured result adapters beyond configured scalar fields and nested
+  text labels without ever storing complete result bodies.
+- Validate the current candidate against additional supported Hermes versions;
+  the real-host matrix is presently anchored to Hermes 0.20.5.
+- Merge, tag, and publish `0.2.0` after the final live profile rollout and visual
+  settings smoke pass are recorded.
 
 ## Deliberately later
 
