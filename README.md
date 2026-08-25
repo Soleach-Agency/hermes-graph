@@ -78,7 +78,7 @@ Open `http://127.0.0.1:5173/`. When the Hermes API is absent, development mode l
 
 ## Installation and lifecycle
 
-The source repository is `Soleach-Agency/hermes-graph`. Before the first public release is cut, install a verified local checkout by copying or cloning this directory to:
+The source repository is `Soleach-Agency/hermes-graph`. A local checkout can be installed by copying or cloning this directory to:
 
 ```text
 ~/.hermes/plugins/hermes-graph/
@@ -99,7 +99,7 @@ Before publishing or after upgrading Hermes, validate the directory with the hos
 hermes plugins doctor ~/.hermes/plugins/hermes-graph --ci
 ```
 
-After the public release gate passes, install the exact repository with:
+Install the published repository with:
 
 ```bash
 hermes plugins install Soleach-Agency/hermes-graph --no-enable
