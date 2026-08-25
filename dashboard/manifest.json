@@ -3,7 +3,7 @@
   "label": "Hermes Graph",
   "description": "Real-time 3D galaxy view of Hermes activity and knowledge",
   "icon": "Sparkles",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "tab": {
     "path": "/hermes-graph",
     "position": "after:sessions"
@@ -12,4 +12,3 @@
   "css": "dist/style.css",
   "api": "plugin_api.py"
 }
-

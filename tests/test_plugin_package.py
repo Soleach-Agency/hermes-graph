@@ -45,7 +45,9 @@ class PluginPackageTests(unittest.TestCase):
                 in_hooks = False
 
         self.assertIn("name: hermes-graph", text)
-        self.assertIn("manifest_version: 2", text)
+        self.assertIn('version: "0.1.1"', text)
+        self.assertIn("manifest_version: 1", text)
+        self.assertIn("api_version: 1", text)
         self.assertEqual(set(declared_hooks), set(HOOKS))
 
     def test_dashboard_bundle_is_declared_and_prebuilt(self):

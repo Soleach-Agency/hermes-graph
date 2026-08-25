@@ -1,7 +1,10 @@
 name: hermes-graph
-version: "0.1.0"
+version: "0.1.1"
 description: Real-time 3D galaxy viewer for Hermes Agent activity and knowledge graphs
-manifest_version: 2
+# Hermes 0.20.5 can load manifest v2, but its public-repository installer
+# accepts up to v1. Keep the portable manifest at v1 until that installer gap
+# is closed; the plugin runtime API remains independently pinned below.
+manifest_version: 1
 api_version: 1
 tags: [observability, dashboard, graph, obsidian]
 provides_hooks:

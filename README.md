@@ -99,7 +99,7 @@ Before publishing or after upgrading Hermes, validate the directory with the hos
 hermes plugins doctor ~/.hermes/plugins/hermes-graph --ci
 ```
 
-Once repository visibility is public, install the published repository with:
+Install the published repository with:
 
 ```bash
 hermes plugins install Soleach-Agency/hermes-graph --no-enable
