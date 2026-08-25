@@ -127,3 +127,7 @@ The built-in benchmark is a practical visual smoke test rather than a formal cro
 - [Build a Hermes Plugin](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins)
 - [Plugin lifecycle hooks](https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks)
 - [Extending the Web Dashboard](https://hermes-agent.nousresearch.com/docs/user-guide/features/extending-the-dashboard)
+
+## License
+
+Hermes Graph is released under the [MIT License](LICENSE), matching Hermes Agent's permissive license.
