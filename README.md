@@ -28,7 +28,7 @@ The product scope lives in [`PROJECT_SCOPE.md`](PROJECT_SCOPE.md).
 - Playback windows for 1 hour, 6 hours, 1 day (default), 7 days, 30 days, or the complete retained history.
 - Built-in 10k, 25k, and 50k node performance scenes.
 
-Vault indexing is available from the viewer's **Settings** panel: enter the vault directory that is visible to the machine running Hermes, then choose **Connect / Refresh**. File watching and richer Kanban dependency loading remain follow-up integrations; manual refresh already produces the real vault topology.
+Vault indexing is available from the viewer's **Settings** panel: enter the vault directory that is visible to the machine running Hermes, then choose **Connect / Refresh**. The plugin-owned watcher keeps Markdown creates, edits, renames, and deletes synchronized after configuration; **Connect / Refresh** remains the explicit recovery path when the vault was unavailable or events were missed. Kanban hydration is read-only and preserves task/dependency topology without copying card bodies or comments.
 
 ## Plugin layout
 
@@ -58,8 +58,10 @@ Build and test:
 
 ```bash
 cd dashboard
-npm install
+npm ci
 npm run build
+
+npm test -- --run
 
 cd ..
 python3 -m unittest discover -s tests -v
@@ -74,9 +76,9 @@ npm run dev
 
 Open `http://127.0.0.1:5173/`. When the Hermes API is absent, development mode loads the deterministic 10k-node scene. Use the `PERF` controls for the larger scenes.
 
-## Manual Hermes installation
+## Installation and lifecycle
 
-Until the repository is published in the Hermes plugin index, copy or clone this directory to:
+The repository target is currently `Soleach-Agency/hermes-graph`, but publication is not claimed by this release candidate. Until the owner authorizes publication, install a local checkout by copying or cloning this directory to:
 
 ```text
 ~/.hermes/plugins/hermes-graph/
@@ -97,9 +99,19 @@ Before publishing or after upgrading Hermes, validate the directory with the hos
 hermes plugins doctor ~/.hermes/plugins/hermes-graph --ci
 ```
 
-Once this repository is published, the intended installation path is `hermes plugins install <owner>/<repository>`, followed by `hermes plugins enable hermes-graph`. The pre-built Dashboard bundle is included, so end users do not need Node.js or npm.
+After an authorized publication, install the exact repository with:
 
-For an internet-reachable Hermes server, follow Hermes' Dashboard authentication guidance; do not expose an unauthenticated Dashboard port publicly.
+```bash
+hermes plugins install Soleach-Agency/hermes-graph --no-enable
+hermes plugins enable hermes-graph
+hermes plugins doctor ~/.hermes/plugins/hermes-graph --ci
+```
+
+The pre-built Dashboard bundle is included, so end users do not need Node.js or npm. To upgrade an installed checkout, run `hermes plugins update hermes-graph`, then run the doctor command and restart the Dashboard. To roll back, reinstall a previously verified commit with `hermes plugins install Soleach-Agency/hermes-graph --ref <40-character-commit-sha> --force`, validate it, and enable it again. Disable without deleting data with `hermes plugins disable hermes-graph`; remove the plugin with `hermes plugins uninstall hermes-graph` only after preserving any data required for a later migration.
+
+The plugin has no separate collector or service. Its SQLite store is local and plugin-owned. To migrate or preserve local data, stop Hermes, copy `$HERMES_HOME/plugin-data/hermes-graph/events.sqlite3` together with its `-wal` and `-shm` companions when present, install the target version, and restore the files before restarting. The older `$HERMES_HOME/hermes-graph/events.sqlite3` location is read as a compatibility fallback; no remote upload or automatic cloud migration occurs.
+
+For an internet-reachable Hermes server, bind the Dashboard only with Hermes' authenticated configuration. `--insecure` is deprecated and does not disable authentication; prefer the default loopback bind and an authenticated tunnel. Never expose an unauthenticated Dashboard port publicly.
 
 ## Data location
 
