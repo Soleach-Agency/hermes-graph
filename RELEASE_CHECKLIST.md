@@ -1,10 +1,9 @@
 # Hermes Graph 0.1.0 release checklist
 
 This is the release-candidate record for `Soleach-Agency/hermes-graph`. The owner
-selected the MIT License and authorized publication on 2026-08-25. Publication
-still waits for the integrated candidate to pass the live-host deployment and
-compatibility checks below; authorization is not treated as evidence that those
-checks passed.
+selected the MIT License and authorized creation of the tagged release in the
+existing private repository on 2026-08-25. Changing repository visibility to
+public remains a separate approval gate.
 
 ## Package checks
 
@@ -44,8 +43,10 @@ worktree. `UNVERIFIED` is intentionally not a pass.
 ## Release gate
 
 - [x] Owner chose and recorded the MIT License.
-- [x] Owner authorized publication of `Soleach-Agency/hermes-graph`.
+- [x] Owner authorized the tagged release in the existing private repository.
 - [x] Dependency implementations are integrated and affected local checks rerun.
 - [x] The operator reran every formerly unavailable live-host cell and recorded the
   observed result without treating missing evidence as a pass.
-- [ ] Create the `v0.1.0` repository release and verify the public installation URL.
+- [x] Create the `v0.1.0` repository release.
+- [ ] Obtain explicit authorization to change repository visibility from private to
+  public, then verify anonymous access and the public installation URL.
