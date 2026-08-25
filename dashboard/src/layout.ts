@@ -1,0 +1,201 @@
+import type { SceneEdge, SceneNode } from "./types";
+
+export type Position = [number, number, number];
+
+function hash(value: string): number {
+  let result = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    result ^= value.charCodeAt(index);
+    result = Math.imul(result, 16777619);
+  }
+  return result >>> 0;
+}
+
+function randomFrom(seed: number): number {
+  const value = Math.sin(seed * 12.9898) * 43758.5453;
+  return value - Math.floor(value);
+}
+
+function direction(seed: number): Position {
+  const y = randomFrom(seed + 11) * 2 - 1;
+  const angle = randomFrom(seed + 29) * Math.PI * 2;
+  const radial = Math.sqrt(Math.max(0, 1 - y * y));
+  return [Math.cos(angle) * radial, y, Math.sin(angle) * radial];
+}
+
+function scale([x, y, z]: Position, amount: number): Position {
+  return [x * amount, y * amount, z * amount];
+}
+
+function offset(base: Position, seed: number, distance: number): Position {
+  const [x, y, z] = scale(direction(seed), distance);
+  return [base[0] + x, base[1] + y, base[2] + z];
+}
+
+function average(positions: Position[]): Position | null {
+  if (!positions.length) return null;
+  const total = positions.reduce(
+    (sum, current) => [sum[0] + current[0], sum[1] + current[1], sum[2] + current[2]],
+    [0, 0, 0] as Position,
+  );
+  return [total[0] / positions.length, total[1] / positions.length, total[2] / positions.length];
+}
+
+function clampRadius(position: Position, minimum: number, seed: number): Position {
+  const radius = Math.hypot(position[0], position[1], position[2]);
+  if (radius >= minimum) return position;
+  if (radius < 0.001) return scale(direction(seed), minimum);
+  return scale(position, minimum / radius);
+}
+
+interface LayoutOptions {
+  vaultRadius: number;
+  runtimeOrbitRadius: number;
+}
+
+export function computeSpatialLayout(
+  nodes: SceneNode[],
+  edges: SceneEdge[],
+  options: LayoutOptions,
+): Map<string, Position> {
+  const positions = new Map<string, Position>();
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const neighbors = new Map<string, Array<{ node: SceneNode; edge: SceneEdge }>>();
+
+  for (const edge of edges) {
+    const source = byId.get(edge.source);
+    const target = byId.get(edge.target);
+    if (!source || !target || edge.active === false) continue;
+    neighbors.set(source.id, [...(neighbors.get(source.id) || []), { node: target, edge }]);
+    neighbors.set(target.id, [...(neighbors.get(target.id) || []), { node: source, edge }]);
+  }
+
+  const notes = nodes.filter((node) => node.kind === "note");
+  const noteDegrees = new Map<string, number>();
+  let maxDegree = 1;
+  for (const note of notes) {
+    const degree = (neighbors.get(note.id) || []).filter(({ node }) => node.kind === "note").length;
+    noteDegrees.set(note.id, degree);
+    maxDegree = Math.max(maxDegree, degree);
+  }
+
+  for (const note of notes) {
+    if (note.position) {
+      positions.set(note.id, note.position);
+      continue;
+    }
+    const seed = hash(note.id);
+    const degree = noteDegrees.get(note.id) || 0;
+    const centrality = Math.log1p(degree) / Math.log1p(maxDegree);
+    const outerBias = Math.pow(1 - centrality, 0.72);
+    const radius =
+      12 + outerBias * (options.vaultRadius - 12) * (0.82 + randomFrom(seed + 43) * 0.18);
+    positions.set(note.id, scale(direction(seed), radius));
+  }
+
+  const anchors = nodes.filter((node) => node.kind === "session" || node.kind === "task");
+  anchors.forEach((node, index) => {
+    if (node.position) {
+      positions.set(node.id, node.position);
+      return;
+    }
+    const seed = hash(node.id);
+    const radius =
+      options.runtimeOrbitRadius +
+      (node.kind === "task" ? 22 : 0) +
+      (randomFrom(seed + 73) - 0.5) * 34;
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    const y = 1 - ((index + 0.5) / Math.max(1, anchors.length)) * 2;
+    const radial = Math.sqrt(Math.max(0, 1 - y * y));
+    const angle = index * goldenAngle + randomFrom(seed) * 0.25;
+    positions.set(node.id, [
+      Math.cos(angle) * radial * radius,
+      y * radius,
+      Math.sin(angle) * radial * radius,
+    ]);
+  });
+
+  const agents = nodes.filter((node) => node.kind === "agent");
+  agents.forEach((node, index) => {
+    if (node.position) {
+      positions.set(node.id, node.position);
+      return;
+    }
+    const relatedAnchors = (neighbors.get(node.id) || [])
+      .filter(({ node: related }) => related.kind === "session" || related.kind === "task")
+      .map(({ node: related }) => positions.get(related.id))
+      .filter((position): position is Position => Boolean(position));
+    const owner = average(relatedAnchors);
+    const fallback = scale(
+      direction(hash(node.id)),
+      options.runtimeOrbitRadius + 38 + (index % 5) * 4,
+    );
+    positions.set(node.id, offset(owner || fallback, hash(node.id) + 101, owner ? 34 : 0));
+  });
+
+  const subagents = nodes.filter(
+    (node) =>
+      node.kind === "subagent" ||
+      (node.kind === "agent" &&
+        (neighbors.get(node.id) || []).some(({ edge }) => edge.kind === "spawned")),
+  );
+  for (const node of subagents) {
+    const parentRelation = (neighbors.get(node.id) || []).find(
+      ({ edge, node: related }) =>
+        edge.kind === "spawned" && edge.target === node.id && related.id !== node.id,
+    );
+    const owner = parentRelation ? positions.get(parentRelation.node.id) : undefined;
+    if (owner) {
+      positions.set(node.id, offset(owner, hash(node.id) + 211, 18 + randomFrom(hash(node.id)) * 15));
+    }
+  }
+
+  const satellites = nodes.filter((node) =>
+    ["tool", "artifact", "skill", "result", "search", "external"].includes(node.kind),
+  );
+  for (const node of satellites) {
+    if (node.position) {
+      positions.set(node.id, node.position);
+      continue;
+    }
+    const relatedPositions = (neighbors.get(node.id) || [])
+      .filter(({ node: related, edge }) => {
+        if (related.kind === "note") return false;
+        if (node.kind === "tool") return edge.kind === "called";
+        if (node.kind === "result") return edge.kind === "returned";
+        return ["produced", "authored", "called", "returned", "belongs_to"].includes(
+          edge.kind,
+        );
+      })
+      .map(({ node: related }) => positions.get(related.id))
+      .filter((position): position is Position => Boolean(position));
+    const owner = average(relatedPositions);
+    const base = owner || scale(direction(hash(node.id)), options.runtimeOrbitRadius + 70);
+    const distance = node.kind === "result" ? 11 : node.kind === "tool" ? 22 : 28;
+    positions.set(node.id, offset(base, hash(node.id) + 307, distance));
+  }
+
+  nodes.forEach((node, index) => {
+    if (!positions.has(node.id)) {
+      positions.set(
+        node.id,
+        scale(direction(hash(node.id) + index), options.runtimeOrbitRadius + 75),
+      );
+    }
+  });
+
+  // Runtime entities are never allowed to drift into the knowledge sphere.
+  // Retrieval edges may cross the boundary, but their tool endpoint stays outside.
+  const runtimeBoundary = options.vaultRadius + 42;
+  for (const node of nodes) {
+    if (node.kind === "note") continue;
+    const position = positions.get(node.id);
+    if (!position) continue;
+    positions.set(
+      node.id,
+      clampRadius(position, runtimeBoundary, hash(node.id) + 911),
+    );
+  }
+
+  return positions;
+}

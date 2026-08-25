@@ -1,0 +1,21 @@
+name: hermes-graph
+version: "0.1.0"
+description: Real-time 3D galaxy viewer for Hermes Agent activity and knowledge graphs
+manifest_version: 2
+api_version: 1
+tags: [observability, dashboard, graph, obsidian]
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - subagent_start
+  - subagent_stop
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
