@@ -132,6 +132,15 @@ def ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS runtime_hydration_entities (
+                provenance TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                projected_at REAL NOT NULL,
+                created_by_hydration INTEGER NOT NULL,
+                PRIMARY KEY (provenance, entity_kind, entity_id)
+            );
+
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -563,5 +572,105 @@ def replace_vault_projection(
             INSERT INTO events(event_id, event_type, occurred_at, source, session_id, payload_json)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
+            event_rows,
+        )
+
+
+def replace_runtime_hydration_projection(
+    provenance: str, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+) -> None:
+    """Reconcile one hydration provenance without overwriting newer live hooks.
+
+    The ledger owns only entities initially created by a hydration adapter.
+    Consequently a later lifecycle hook can update an entity (or create a
+    colliding identity) without a subsequent stale startup deleting it.
+    """
+    next_entities = {
+        "node": {entity["id"]: entity for entity in nodes},
+        "edge": {entity["id"]: entity for entity in edges},
+    }
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        event_rows: list[tuple[str, str, float, str, None, str]] = []
+
+        for entity_kind in ("edge", "node"):
+            table = "edges" if entity_kind == "edge" else "nodes"
+            for entity_id, entity in next_entities[entity_kind].items():
+                existing = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (entity_id,)).fetchone()
+                owned = conn.execute(
+                    "SELECT projected_at, created_by_hydration FROM runtime_hydration_entities "
+                    "WHERE provenance = ? AND entity_kind = ? AND entity_id = ?",
+                    (provenance, entity_kind, entity_id),
+                ).fetchone()
+                if entity_kind == "node":
+                    values = (entity["kind"], entity["label"], entity["status"], entity.get("color"), entity.get("size"), entity.get("pressure"), _json(entity.get("metadata", {})))
+                    previous = None if existing is None else (existing["kind"], existing["label"], existing["status"], existing["color"], existing["size"], existing["pressure"], existing["metadata_json"])
+                else:
+                    values = (entity["source"], entity["target"], entity["kind"], int(entity.get("active", True)), _json(entity.get("metadata", {})))
+                    previous = None if existing is None else (existing["source_id"], existing["target_id"], existing["kind"], existing["active"], existing["metadata_json"])
+                live_newer = bool(
+                    existing is not None and owned is not None and float(existing["updated_at"]) > float(owned["projected_at"])
+                )
+                changed = previous != values and not live_newer
+                now = utc_timestamp()
+                if changed and entity_kind == "node":
+                    if existing is None:
+                        conn.execute(
+                            "INSERT INTO nodes(id, kind, label, status, color, size, pressure, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (entity_id, *values, now, now),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE nodes SET kind=?, label=?, status=?, color=?, size=?, pressure=?, metadata_json=?, updated_at=? WHERE id=?",
+                            (*values, now, entity_id),
+                        )
+                elif changed:
+                    if existing is None:
+                        conn.execute(
+                            "INSERT INTO edges(id, source_id, target_id, kind, active, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (entity_id, *values, now, now),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE edges SET source_id=?, target_id=?, kind=?, active=?, metadata_json=?, updated_at=? WHERE id=?",
+                            (*values, now, entity_id),
+                        )
+                projected_at = now if changed else (
+                    float(owned["projected_at"])
+                    if owned is not None
+                    else float(existing["updated_at"])
+                    if existing is not None
+                    else now
+                )
+                created_by_hydration = int(owned["created_by_hydration"]) if owned is not None else int(existing is None)
+                conn.execute(
+                    "INSERT INTO runtime_hydration_entities(provenance, entity_kind, entity_id, projected_at, created_by_hydration) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(provenance, entity_kind, entity_id) DO UPDATE SET projected_at=excluded.projected_at, created_by_hydration=excluded.created_by_hydration",
+                    (provenance, entity_kind, entity_id, projected_at, created_by_hydration),
+                )
+                if changed:
+                    event_rows.append((str(uuid.uuid4()), f"scene.{entity_kind}_upsert", now, f"hydration:{provenance}", None, _json({entity_kind: entity})))
+
+        for entity_kind in ("edge", "node"):
+            table = "edges" if entity_kind == "edge" else "nodes"
+            owned_rows = conn.execute(
+                "SELECT entity_id, projected_at, created_by_hydration FROM runtime_hydration_entities WHERE provenance = ? AND entity_kind = ?",
+                (provenance, entity_kind),
+            ).fetchall()
+            for owned in owned_rows:
+                entity_id = str(owned["entity_id"])
+                if entity_id in next_entities[entity_kind]:
+                    continue
+                current = conn.execute(f"SELECT updated_at FROM {table} WHERE id = ?", (entity_id,)).fetchone()
+                now = utc_timestamp()
+                if current is not None and bool(owned["created_by_hydration"]) and float(current["updated_at"]) == float(owned["projected_at"]):
+                    conn.execute(f"DELETE FROM {table} WHERE id = ?", (entity_id,))
+                    event_rows.append((str(uuid.uuid4()), f"scene.{entity_kind}_delete", now, f"hydration:{provenance}", None, _json({"id": entity_id})))
+                conn.execute(
+                    "DELETE FROM runtime_hydration_entities WHERE provenance = ? AND entity_kind = ? AND entity_id = ?",
+                    (provenance, entity_kind, entity_id),
+                )
+        conn.executemany(
+            "INSERT INTO events(event_id, event_type, occurred_at, source, session_id, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
             event_rows,
         )
