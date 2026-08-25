@@ -7,6 +7,7 @@ import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 
 import { computeSpatialLayout, type Position } from "./layout";
+import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
 import {
   DEFAULT_THEME,
   type GraphTheme,
@@ -24,7 +25,9 @@ const vertexShader = `
   attribute vec3 aNodeColorFrom;
   attribute float aIntensity;
   attribute float aIntensityFrom;
-  attribute float aDoneAge;
+  attribute float aLifecycleAge;
+  attribute float aLifecycleDuration;
+  attribute float aLifecycleEligible;
   attribute float aBornAge;
   attribute float aJumpStart;
   attribute float aJumpEnd;
@@ -36,7 +39,7 @@ const vertexShader = `
   varying float vJumpPulse;
   uniform float uPixelRatio;
   uniform float uTime;
-  uniform float uKanbanFadeSeconds;
+  uniform float uLifecycleRate;
   uniform float uJumpTargetScale;
   uniform float uTransitionStart;
   uniform float uTransitionDuration;
@@ -51,7 +54,12 @@ const vertexShader = `
     float animatedSize = mix(aSizeFrom, aSize, transition);
     vColor = mix(aNodeColorFrom, aNodeColor, transition);
     vIntensity = mix(aIntensityFrom, aIntensity, transition);
-    vLifecycle = aDoneAge < 0.0 ? 0.0 : clamp((aDoneAge + uTime) / uKanbanFadeSeconds, 0.0, 1.0);
+    float liveLifecycleElapsed = max(0.0, uTime - uTransitionStart) * uLifecycleRate;
+    vLifecycle = aLifecycleEligible * clamp(
+      (aLifecycleAge + liveLifecycleElapsed) / max(1.0, aLifecycleDuration),
+      0.0,
+      1.0
+    );
     vBirth = aBornAge < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aBornAge + uTime);
     float safeJumpStart = max(0.0, aJumpStart);
     float safeJumpEnd = max(safeJumpStart + 0.08, aJumpEnd);
@@ -200,12 +208,16 @@ export class GraphScene {
   setSnapshot(snapshot: SceneSnapshot): void {
     const previousVisuals = this.captureCurrentVisuals();
     this.snapshot = snapshot;
-    const now = Date.now() / 1000;
     const fadeSeconds = this.theme.kanbanFadeHours * 3600;
+    const lifecycle = resolveLifecycleVisuals(
+      snapshot.nodes,
+      snapshot.edges,
+      snapshot.asOf ?? Date.now() / 1000,
+      fadeSeconds,
+    );
     this.nodes = snapshot.nodes.filter((node) => {
-      if (node.kind !== "task" || node.status !== "done") return true;
-      const completedAt = Number(node.metadata?.completedAt || 0);
-      return !completedAt || now - completedAt < fadeSeconds;
+      const visual = lifecycle.get(node.id);
+      return !visual || visual.age < visual.duration;
     });
     const visibleIds = new Set(this.nodes.map((node) => node.id));
     const visibleEdges = snapshot.edges.filter(
@@ -217,7 +229,13 @@ export class GraphScene {
     });
     this.disposeGraph();
     this.transitionStartedAt = this.clock.elapsedTime;
-    this.points = this.createPoints(this.nodes, positions, previousVisuals);
+    this.points = this.createPoints(
+      this.nodes,
+      positions,
+      previousVisuals,
+      lifecycle,
+      snapshot.historical === true ? 0 : 1,
+    );
     this.edges = this.createEdges(this.nodes, visibleEdges, positions);
     this.edgeCount = visibleEdges.length;
     this.scene.add(this.edges, this.points);
@@ -295,6 +313,8 @@ export class GraphScene {
     nodes: SceneNode[],
     nodePositions: Map<string, Position>,
     previousVisuals: Map<string, NodeVisual> | null,
+    lifecycle: Map<string, LifecycleVisual>,
+    lifecycleRate: number,
   ): THREE.Points {
     const positions = new Float32Array(nodes.length * 3);
     const positionsFrom = new Float32Array(nodes.length * 3);
@@ -304,7 +324,9 @@ export class GraphScene {
     const sizesFrom = new Float32Array(nodes.length);
     const intensities = new Float32Array(nodes.length);
     const intensitiesFrom = new Float32Array(nodes.length);
-    const doneAges = new Float32Array(nodes.length);
+    const lifecycleAges = new Float32Array(nodes.length);
+    const lifecycleDurations = new Float32Array(nodes.length);
+    const lifecycleEligible = new Float32Array(nodes.length);
     const bornAges = new Float32Array(nodes.length);
     const jumpStarts = new Float32Array(nodes.length);
     const jumpEnds = new Float32Array(nodes.length);
@@ -355,10 +377,10 @@ export class GraphScene {
       colorsFrom.set(previous?.color || [color.r, color.g, color.b], index * 3);
       sizesFrom[index] = previous?.size ?? (hasPreviousScene ? sizes[index] * 0.12 : sizes[index]);
       intensitiesFrom[index] = previous?.intensity ?? (hasPreviousScene ? 0 : intensities[index]);
-      const completedAt = Number(node.metadata?.completedAt || 0);
-      doneAges[index] = node.kind === "task" && node.status === "done" && completedAt
-        ? Math.max(0, Date.now() / 1000 - completedAt)
-        : -1;
+      const lifecycleVisual = lifecycle.get(node.id);
+      lifecycleAges[index] = lifecycleVisual?.age ?? 0;
+      lifecycleDurations[index] = lifecycleVisual?.duration ?? 1;
+      lifecycleEligible[index] = lifecycleVisual ? 1 : 0;
       const createdAt = Number(node.metadata?.createdAt || 0);
       bornAges[index] = ["result", "artifact", "skill"].includes(node.kind) && createdAt
         ? Math.max(0, Date.now() / 1000 - createdAt)
@@ -374,7 +396,9 @@ export class GraphScene {
     geometry.setAttribute("aSizeFrom", new THREE.BufferAttribute(sizesFrom, 1));
     geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
     geometry.setAttribute("aIntensityFrom", new THREE.BufferAttribute(intensitiesFrom, 1));
-    geometry.setAttribute("aDoneAge", new THREE.BufferAttribute(doneAges, 1));
+    geometry.setAttribute("aLifecycleAge", new THREE.BufferAttribute(lifecycleAges, 1));
+    geometry.setAttribute("aLifecycleDuration", new THREE.BufferAttribute(lifecycleDurations, 1));
+    geometry.setAttribute("aLifecycleEligible", new THREE.BufferAttribute(lifecycleEligible, 1));
     geometry.setAttribute("aBornAge", new THREE.BufferAttribute(bornAges, 1));
     geometry.setAttribute("aJumpStart", new THREE.BufferAttribute(jumpStarts, 1));
     geometry.setAttribute("aJumpEnd", new THREE.BufferAttribute(jumpEnds, 1));
@@ -386,7 +410,7 @@ export class GraphScene {
       uniforms: {
         uPixelRatio: { value: this.renderer.getPixelRatio() },
         uTime: { value: 0 },
-        uKanbanFadeSeconds: { value: this.theme.kanbanFadeHours * 3600 },
+        uLifecycleRate: { value: lifecycleRate },
         uJumpTargetScale: { value: this.theme.jumpTargetScale },
         uJumpTargetBrightness: { value: this.theme.jumpTargetBrightness },
         uTransitionStart: { value: this.transitionStartedAt },

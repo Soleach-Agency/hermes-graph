@@ -38,12 +38,22 @@ export function createDemoSnapshot(
   for (let sessionIndex = 0; sessionIndex < sessionCount; sessionIndex += 1) {
     const sessionId = `session:${sessionIndex}`;
     const agentId = `agent:${sessionIndex}`;
+    const lifecycleAgeHours =
+      sessionIndex === sessionCount - 1
+        ? 8
+        : sessionIndex === sessionCount - 2
+          ? 1.5
+          : null;
     runtimeNodes.push({
       id: sessionId,
       kind: "session",
       label: `Session ${sessionIndex + 1}`,
-      status: "active",
-      metadata: { platform: sessionIndex % 2 ? "gateway" : "cli" },
+      status: lifecycleAgeHours === null ? "active" : "completed",
+      metadata: {
+        platform: sessionIndex % 2 ? "gateway" : "cli",
+        completedAt:
+          lifecycleAgeHours === null ? undefined : now - lifecycleAgeHours * 3600,
+      },
     });
     runtimeNodes.push({
       id: agentId,
@@ -189,6 +199,8 @@ export function createDemoSnapshot(
   return {
     schemaVersion: 1,
     cursor,
+    asOf: now,
+    historical: cursor < DEMO_TIMELINE_CURSOR,
     nodes: [...notes, ...runtimeNodes],
     edges,
   };

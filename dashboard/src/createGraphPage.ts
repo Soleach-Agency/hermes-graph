@@ -1,6 +1,14 @@
 import { createDemoSnapshot, DEMO_TIMELINE_CURSOR } from "./demo";
 import { GraphScene } from "./GraphScene";
-import { DEFAULT_THEME, type GraphTheme, type SceneNode, type SceneSnapshot } from "./types";
+import {
+  DEFAULT_THEME,
+  DEFAULT_TOOL_RULES,
+  type GraphPreferences,
+  type GraphTheme,
+  type SceneNode,
+  type SceneSnapshot,
+  type ToolRoutingRule,
+} from "./types";
 
 type ReactApi = {
   createElement: (...args: any[]) => any;
@@ -65,34 +73,38 @@ function metadataRows(node: SceneNode): Array<[string, string]> {
   return rows.slice(0, 5);
 }
 
-function loadSavedTheme(): GraphTheme {
+function mergeTheme(saved?: Partial<GraphTheme> | null): GraphTheme {
+  const migratedHopDelay =
+    saved?.jumpTimingVersion === 2
+      ? saved.activityHopDelayMs ?? DEFAULT_THEME.activityHopDelayMs
+      : (saved?.activityHopDelayMs ?? 250) / 10;
+  return {
+    ...DEFAULT_THEME,
+    ...saved,
+    jumpTimingVersion: 2,
+    activityHopDelayMs: migratedHopDelay,
+    edgeColor:
+      saved?.edgeThickness === undefined
+        ? DEFAULT_THEME.edgeColor
+        : saved.edgeColor || DEFAULT_THEME.edgeColor,
+    nodeColors: { ...DEFAULT_THEME.nodeColors, ...saved?.nodeColors },
+    kanbanColors: { ...DEFAULT_THEME.kanbanColors, ...saved?.kanbanColors },
+  };
+}
+
+function loadLocalPreferences(): GraphPreferences {
   try {
     const saved = JSON.parse(localStorage.getItem("hermes-graph:theme") || "null") as
       | Partial<GraphTheme>
       | null;
-    const migratedHopDelay =
-      saved?.jumpTimingVersion === 2
-        ? saved.activityHopDelayMs ?? DEFAULT_THEME.activityHopDelayMs
-        : (saved?.activityHopDelayMs ?? 250) / 10;
     return {
-      ...DEFAULT_THEME,
-      ...saved,
-      jumpTimingVersion: 2,
-      activityHopDelayMs: migratedHopDelay,
-      // Edge color existed internally before it was user-configurable. Migrate
-      // those old saved themes to the new, darker wide-line default.
-      edgeColor:
-        saved?.edgeThickness === undefined
-          ? DEFAULT_THEME.edgeColor
-          : saved.edgeColor || DEFAULT_THEME.edgeColor,
-      nodeColors: { ...DEFAULT_THEME.nodeColors, ...saved?.nodeColors },
-      kanbanColors: { ...DEFAULT_THEME.kanbanColors, ...saved?.kanbanColors },
+      theme: mergeTheme(saved),
+      toolRules: [...DEFAULT_TOOL_RULES],
     };
   } catch {
     return {
-      ...DEFAULT_THEME,
-      nodeColors: { ...DEFAULT_THEME.nodeColors },
-      kanbanColors: { ...DEFAULT_THEME.kanbanColors },
+      theme: mergeTheme(),
+      toolRules: [...DEFAULT_TOOL_RULES],
     };
   }
 }
@@ -115,7 +127,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const demoCountRef = React.useRef(10_000);
     const playbackStartRef = React.useRef(0);
     const playbackLoadingRef = React.useRef(false);
-    const initialThemeRef = React.useRef<GraphTheme>(loadSavedTheme());
+    const initialPreferencesRef = React.useRef<GraphPreferences>(loadLocalPreferences());
     const [hover, setHover] = React.useState<HoverState>(null);
     const [stats, setStats] = React.useState<Stats>({ nodes: 0, edges: 0, fps: 0 });
     const [connection, setConnection] = React.useState("CONNECTING");
@@ -124,7 +136,13 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const [playing, setPlaying] = React.useState(false);
     const [viewCursor, setViewCursor] = React.useState(0);
     const [maxCursor, setMaxCursor] = React.useState(0);
-    const [theme, setTheme] = React.useState(initialThemeRef.current);
+    const [theme, setTheme] = React.useState(initialPreferencesRef.current.theme);
+    const [toolRules, setToolRules] = React.useState<ToolRoutingRule[]>(
+      initialPreferencesRef.current.toolRules,
+    );
+    const [knownTools, setKnownTools] = React.useState<string[]>([]);
+    const [settingsBusy, setSettingsBusy] = React.useState(false);
+    const [settingsMessage, setSettingsMessage] = React.useState("NOT SAVED");
     const [settingsOpen, setSettingsOpen] = React.useState(false);
     const [vaultPath, setVaultPath] = React.useState("");
     const [vaultMessage, setVaultMessage] = React.useState("NOT CONNECTED");
@@ -168,6 +186,10 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           sceneRef.current?.setSnapshot(snapshot);
           setIsDemo(false);
         }
+        setKnownTools((current) => Array.from(new Set([
+          ...current,
+          ...snapshot.nodes.filter((node) => node.kind === "tool").map((node) => node.label),
+        ])).sort((left, right) => left.localeCompare(right)));
         setConnection("LIVE");
       } catch (error) {
         if (options.demoOnEmpty) {
@@ -185,7 +207,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         onHover: (node, x, y) => setHover(node ? { node, x, y } : null),
         onStats: (next) =>
           setStats((current) => ({ ...next, fps: next.fps || current.fps })),
-        theme: initialThemeRef.current,
+        theme: initialPreferencesRef.current.theme,
       });
       sceneRef.current = scene;
       void loadSnapshot();
@@ -251,6 +273,26 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         scene.dispose();
         sceneRef.current = null;
       };
+    }, []);
+
+    React.useEffect(() => {
+      void fetchJSON<Partial<GraphPreferences>>("/api/plugins/hermes-graph/settings")
+        .then((saved) => {
+          const hasServerPreferences =
+            Boolean(saved.theme && Object.keys(saved.theme).length) ||
+            Boolean(saved.toolRules?.length);
+          if (!hasServerPreferences) {
+            setSettingsMessage("LOCAL SETTINGS · SAVE TO SERVER");
+            return;
+          }
+          const nextTheme = mergeTheme(saved.theme);
+          const nextRules = Array.isArray(saved.toolRules) ? saved.toolRules : [];
+          setTheme(nextTheme);
+          setToolRules(nextRules);
+          sceneRef.current?.setTheme(nextTheme);
+          setSettingsMessage("SAVED ON SERVER");
+        })
+        .catch(() => setSettingsMessage("LOCAL FALLBACK"));
     }, []);
 
     React.useEffect(() => {
@@ -357,21 +399,21 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       setPlaying(startCursor < maxCursor);
     };
 
-    const saveTheme = (next: GraphTheme) => {
+    const previewTheme = (next: GraphTheme) => {
       setTheme(next);
-      localStorage.setItem("hermes-graph:theme", JSON.stringify(next));
+      setSettingsMessage("UNSAVED CHANGES");
       sceneRef.current?.setTheme(next);
     };
 
     const setTypeColor = (kind: string, color: string) => {
-      saveTheme({
+      previewTheme({
         ...theme,
         nodeColors: { ...theme.nodeColors, [kind]: color },
       });
     };
 
     const setKanbanColor = (status: string, color: string) => {
-      saveTheme({
+      previewTheme({
         ...theme,
         kanbanColors: { ...theme.kanbanColors, [status]: color },
       });
@@ -397,7 +439,54 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       }
     };
 
+    const updateToolRule = (index: number, patch: Partial<ToolRoutingRule>) => {
+      setToolRules((current) => current.map((rule, ruleIndex) =>
+        ruleIndex === index ? { ...rule, ...patch } : rule,
+      ));
+      setSettingsMessage("UNSAVED CHANGES");
+    };
+
+    const addToolRule = () => {
+      setToolRules((current) => [
+        ...current,
+        { tool: "", direction: "vault", referenceField: "path" },
+      ]);
+      setSettingsMessage("UNSAVED CHANGES");
+    };
+
+    const removeToolRule = (index: number) => {
+      setToolRules((current) => current.filter((_, ruleIndex) => ruleIndex !== index));
+      setSettingsMessage("UNSAVED CHANGES");
+    };
+
+    const persistSettings = async () => {
+      if (settingsBusy) return;
+      setSettingsBusy(true);
+      setSettingsMessage("SAVING…");
+      try {
+        const saved = await fetchJSON<GraphPreferences>("/api/plugins/hermes-graph/settings", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ theme, toolRules }),
+        });
+        const nextTheme = mergeTheme(saved.theme);
+        setTheme(nextTheme);
+        setToolRules(saved.toolRules || []);
+        localStorage.setItem("hermes-graph:theme", JSON.stringify(nextTheme));
+        sceneRef.current?.setTheme(nextTheme);
+        setSettingsMessage("SAVED ON SERVER");
+      } catch (error) {
+        setSettingsMessage(error instanceof Error ? "SAVE FAILED" : "ERROR");
+      } finally {
+        setSettingsBusy(false);
+      }
+    };
+
     const rows = hover ? metadataRows(hover.node) : [];
+    const toolOptions = Array.from(new Set([
+      ...knownTools,
+      ...toolRules.map((rule) => rule.tool).filter(Boolean),
+    ])).sort((left, right) => left.localeCompare(right));
     return h(
       "div",
       { className: "hg-root" },
@@ -523,7 +612,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.kanbanFadeHours,
               "aria-label": "Kanban done fade hours",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   kanbanFadeHours: Number((event.target as HTMLInputElement).value),
                 }),
@@ -539,7 +628,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.pressureLow,
               "aria-label": "Agent low pressure color",
               onChange: (event: Event) =>
-                saveTheme({ ...theme, pressureLow: (event.target as HTMLInputElement).value }),
+                previewTheme({ ...theme, pressureLow: (event.target as HTMLInputElement).value }),
             }),
           ),
           h(
@@ -551,7 +640,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.pressureHigh,
               "aria-label": "Agent context limit color",
               onChange: (event: Event) =>
-                saveTheme({ ...theme, pressureHigh: (event.target as HTMLInputElement).value }),
+                previewTheme({ ...theme, pressureHigh: (event.target as HTMLInputElement).value }),
             }),
           ),
           h(
@@ -566,7 +655,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.maxPressureScale,
               "aria-label": "Agent maximum pressure size",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   maxPressureScale: Number((event.target as HTMLInputElement).value),
               }),
@@ -582,7 +671,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.edgeColor,
               "aria-label": "Node link color",
               onChange: (event: Event) =>
-                saveTheme({ ...theme, edgeColor: (event.target as HTMLInputElement).value }),
+                previewTheme({ ...theme, edgeColor: (event.target as HTMLInputElement).value }),
             }),
           ),
           h(
@@ -597,7 +686,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.edgeThickness,
               "aria-label": "Node link thickness",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   edgeThickness: Number((event.target as HTMLInputElement).value),
                 }),
@@ -613,7 +702,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.jumpColor,
               "aria-label": "Jump link color",
               onChange: (event: Event) =>
-                saveTheme({ ...theme, jumpColor: (event.target as HTMLInputElement).value }),
+                previewTheme({ ...theme, jumpColor: (event.target as HTMLInputElement).value }),
             }),
           ),
           h(
@@ -628,7 +717,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.jumpThickness,
               "aria-label": "Jump link thickness",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   jumpThickness: Number((event.target as HTMLInputElement).value),
                 }),
@@ -646,7 +735,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.jumpTargetScale,
               "aria-label": "Jump target size multiplier",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   jumpTargetScale: Number((event.target as HTMLInputElement).value),
                 }),
@@ -664,7 +753,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.jumpTargetBrightness,
               "aria-label": "Jump target brightness multiplier",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   jumpTargetBrightness: Number((event.target as HTMLInputElement).value),
                 }),
@@ -681,7 +770,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
                   type: "button",
                   key: mode,
                   className: theme.activityMode === mode ? "hg-mode-active" : "",
-                  onClick: () => saveTheme({ ...theme, activityMode: mode }),
+                  onClick: () => previewTheme({ ...theme, activityMode: mode }),
                 },
                 mode.toUpperCase(),
               ),
@@ -700,7 +789,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               disabled: theme.activityMode !== "beautiful",
               "aria-label": "Beautiful route hop count",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   activityHopCount: Number((event.target as HTMLInputElement).value),
                 }),
@@ -719,7 +808,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               disabled: theme.activityMode !== "beautiful",
               "aria-label": "Beautiful route hop delay",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   activityHopDelayMs: Number((event.target as HTMLInputElement).value),
                 }),
@@ -737,11 +826,82 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               value: theme.activityTtlSeconds,
               "aria-label": "Activity route lifetime",
               onChange: (event: Event) =>
-                saveTheme({
+                previewTheme({
                   ...theme,
                   activityTtlSeconds: Number((event.target as HTMLInputElement).value),
                 }),
             }),
+          ),
+          h("div", { className: "hg-settings-title hg-pressure-title" }, "TOOL OVERRIDES"),
+          h(
+            "div",
+            { className: "hg-tool-help" },
+            "Override name heuristics and map a returned field to Vault paths.",
+          ),
+          h(
+            "datalist",
+            { id: "hg-known-tools" },
+            ...toolOptions.map((tool) => h("option", { key: tool, value: tool })),
+          ),
+          ...toolRules.map((rule, index) =>
+            h(
+              "div",
+              { className: "hg-tool-rule", key: `${index}:${rule.tool}` },
+              h("input", {
+                type: "text",
+                list: "hg-known-tools",
+                value: rule.tool,
+                placeholder: "tool name",
+                "aria-label": `Tool override ${index + 1} name`,
+                onChange: (event: Event) =>
+                  updateToolRule(index, { tool: (event.target as HTMLInputElement).value }),
+              }),
+              h(
+                "select",
+                {
+                  value: rule.direction,
+                  "aria-label": `Tool override ${index + 1} direction`,
+                  onChange: (event: Event) =>
+                    updateToolRule(index, {
+                      direction: (event.target as HTMLSelectElement).value as ToolRoutingRule["direction"],
+                    }),
+                },
+                h("option", { value: "vault" }, "VAULT"),
+                h("option", { value: "external" }, "EXTERNAL"),
+                h("option", { value: "local" }, "LOCAL"),
+              ),
+              h(
+                "select",
+                {
+                  value: rule.referenceField,
+                  disabled: rule.direction !== "vault",
+                  "aria-label": `Tool override ${index + 1} Vault result field`,
+                  onChange: (event: Event) =>
+                    updateToolRule(index, {
+                      referenceField: (event.target as HTMLSelectElement).value,
+                    }),
+                },
+                h("option", { value: "" }, "NO FIELD"),
+                ...["path", "file", "filepath", "note", "source", "title"].map((field) =>
+                  h("option", { key: field, value: field }, field.toUpperCase()),
+                ),
+              ),
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: "hg-tool-remove",
+                  "aria-label": `Remove tool override ${index + 1}`,
+                  onClick: () => removeToolRule(index),
+                },
+                "REMOVE",
+              ),
+            ),
+          ),
+          h(
+            "button",
+            { type: "button", className: "hg-tool-add", onClick: addToolRule },
+            "+ ADD TOOL OVERRIDE",
           ),
           h(
             "button",
@@ -749,14 +909,25 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               type: "button",
               className: "hg-reset-theme",
               onClick: () =>
-                saveTheme({
+                previewTheme({
                   ...DEFAULT_THEME,
                   nodeColors: { ...DEFAULT_THEME.nodeColors },
                   kanbanColors: { ...DEFAULT_THEME.kanbanColors },
                 }),
             },
-            "RESET DEFAULTS",
+            "RESET VISUAL DEFAULTS",
           ),
+          h(
+            "button",
+            {
+              type: "button",
+              className: "hg-save-settings",
+              disabled: settingsBusy,
+              onClick: () => void persistSettings(),
+            },
+            settingsBusy ? "SAVING…" : "SAVE SETTINGS",
+          ),
+          h("div", { className: "hg-settings-message" }, settingsMessage),
         ),
       hover &&
         h(

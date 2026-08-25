@@ -268,6 +268,8 @@ def upsert_edge(
 
 
 _DELETE_EVENT_NAMESPACE = uuid.UUID("2f7d4bd2-9b6a-4c73-9a53-4f4f9f4c5ad3")
+_LIFECYCLE_CLEANUP_LOCK = threading.Lock()
+_LAST_LIFECYCLE_CLEANUP = 0.0
 
 
 def _expiry(metadata_json: str, now: float) -> bool:
@@ -284,6 +286,19 @@ def _delete_event_id(event_type: str, entity_id: str, created_at: float) -> str:
     return str(uuid.uuid5(_DELETE_EVENT_NAMESPACE, f"{event_type}:{entity_id}:{created_at!r}"))
 
 
+def lifecycle_fade_seconds() -> float:
+    preferences = get_setting("graph_preferences", {})
+    try:
+        fade_hours = float(
+            preferences.get("theme", {}).get("kanbanFadeHours", 24)
+            if isinstance(preferences, dict)
+            else 24
+        )
+    except (AttributeError, TypeError, ValueError):
+        fade_hours = 24
+    return max(6, min(48, fade_hours)) * 3600
+
+
 def cleanup_expired(now: float | None = None) -> dict[str, list[str]]:
     """Remove expired transient projection rows and append replayable deletes.
 
@@ -291,33 +306,131 @@ def cleanup_expired(now: float | None = None) -> dict[str, list[str]]:
     hook activity serialize. Delete events are deterministic for one entity
     lifecycle, so retries after a crash cannot duplicate history.
     """
+    global _LAST_LIFECYCLE_CLEANUP
+    explicit_now = now is not None
     now = utc_timestamp() if now is None else float(now)
+    monotonic_now = time.monotonic()
+    with _LIFECYCLE_CLEANUP_LOCK:
+        run_lifecycle_cleanup = (
+            explicit_now or monotonic_now - _LAST_LIFECYCLE_CLEANUP >= 60
+        )
+        if run_lifecycle_cleanup:
+            _LAST_LIFECYCLE_CLEANUP = monotonic_now
+    fade_seconds = lifecycle_fade_seconds() if run_lifecycle_cleanup else 0
     with connect() as conn:
-        expired_nodes = [
+        expired_result_nodes = [
             row for row in conn.execute(
-                "SELECT id, created_at, metadata_json FROM nodes WHERE kind = 'result'"
+                "SELECT id, kind, status, created_at, metadata_json FROM nodes WHERE kind = 'result'"
             ) if _expiry(row["metadata_json"], now)
         ]
-        expired_node_ids = {row["id"] for row in expired_nodes}
         temporary_edges = list(conn.execute(
             """
-            SELECT id, source_id, target_id, created_at, metadata_json
-            FROM edges
-            WHERE kind IN ('called', 'retrieved', 'returned')
+            SELECT id, source_id, target_id, kind, created_at, metadata_json
+            FROM edges WHERE kind IN ('called', 'retrieved', 'returned')
             """
         ))
-        live_node_ids = {
-            row["id"] for row in conn.execute("SELECT id FROM nodes")
+        endpoint_ids = {
+            str(value)
+            for row in temporary_edges
+            for value in (row["source_id"], row["target_id"])
         }
-        expired_edges = [
-            row for row in temporary_edges
+        live_endpoint_ids: set[str] = set()
+        if endpoint_ids:
+            endpoint_list = sorted(endpoint_ids)
+            for start in range(0, len(endpoint_list), 800):
+                batch = endpoint_list[start : start + 800]
+                placeholders = ",".join("?" for _ in batch)
+                live_endpoint_ids.update(
+                    str(row["id"])
+                    for row in conn.execute(
+                        f"SELECT id FROM nodes WHERE id IN ({placeholders})", batch
+                    )
+                )
+
+        node_rows = (
+            list(conn.execute(
+                "SELECT id, kind, status, created_at, metadata_json FROM nodes"
+            ))
+            if run_lifecycle_cleanup
+            else []
+        )
+        by_id = {str(row["id"]): row for row in node_rows}
+        completion: dict[str, float] = {}
+        completed_statuses = {"done", "completed", "stopped", "reset"}
+        for row in node_rows:
+            if str(row["status"]).lower() not in completed_statuses:
+                continue
+            try:
+                metadata = json.loads(row["metadata_json"])
+                completed_at = float(metadata.get("completedAt"))
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if completed_at > 0:
+                completion[str(row["id"])] = completed_at
+
+        owner_edges = (
+            list(conn.execute(
+                """
+                SELECT id, source_id, target_id, kind, created_at, metadata_json
+                FROM edges WHERE kind IN ('belongs_to', 'works_on')
+                """
+            ))
+            if run_lifecycle_cleanup
+            else []
+        )
+        owner_targets: dict[str, list[str]] = {}
+        for edge in owner_edges:
+            owner_targets.setdefault(str(edge["source_id"]), []).append(
+                str(edge["target_id"])
+            )
+        changed = True
+        while changed:
+            changed = False
+            for owner, targets in owner_targets.items():
+                if owner in completion or owner not in by_id or not targets:
+                    continue
+                if all(target in completion for target in targets):
+                    completion[owner] = max(completion[target] for target in targets)
+                    changed = True
+        for row in node_rows:
+            if row["kind"] != "tool":
+                continue
+            try:
+                owner = str(json.loads(row["metadata_json"]).get("owner") or "")
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                owner = ""
+            if owner in completion:
+                completion[str(row["id"])] = completion[owner]
+
+        expired_lifecycle_nodes = [
+            row
+            for row in node_rows
+            if str(row["id"]) in completion
+            and now
+            >= completion[str(row["id"])]
+            + fade_seconds * (0.3 if row["kind"] == "tool" else 1.0)
+        ]
+        expired_nodes_by_id = {
+            str(row["id"]): row
+            for row in [*expired_result_nodes, *expired_lifecycle_nodes]
+        }
+        expired_node_ids = set(expired_nodes_by_id)
+        expired_edges_by_id = {
+            str(row["id"]): row
+            for row in temporary_edges
             if _expiry(row["metadata_json"], now)
+            or str(row["source_id"]) not in live_endpoint_ids
+            or str(row["target_id"]) not in live_endpoint_ids
             or row["source_id"] in expired_node_ids
             or row["target_id"] in expired_node_ids
-            or row["source_id"] not in live_node_ids
-            or row["target_id"] not in live_node_ids
-        ]
-        expired_edge_ids = {row["id"] for row in expired_edges}
+        }
+        if expired_node_ids:
+            for row in conn.execute(
+                "SELECT id, source_id, target_id, kind, created_at, metadata_json FROM edges"
+            ):
+                if row["source_id"] in expired_node_ids or row["target_id"] in expired_node_ids:
+                    expired_edges_by_id[str(row["id"])] = row
+        expired_edge_ids = set(expired_edges_by_id)
 
         # Edges are removed first so the live projection never contains a
         # dangling reference, including during result-node expiry.
@@ -327,12 +440,12 @@ def cleanup_expired(now: float | None = None) -> dict[str, list[str]]:
             conn.executemany("DELETE FROM nodes WHERE id = ?", [(item,) for item in expired_node_ids])
 
         event_rows: list[tuple[str, str, float, str, None, str]] = []
-        for row in sorted(expired_edges, key=lambda item: item["id"]):
+        for row in sorted(expired_edges_by_id.values(), key=lambda item: item["id"]):
             event_rows.append((
                 _delete_event_id("scene.edge_delete", row["id"], float(row["created_at"])),
                 "scene.edge_delete", now, "projection", None, _json({"id": row["id"]}),
             ))
-        for row in sorted(expired_nodes, key=lambda item: item["id"]):
+        for row in sorted(expired_nodes_by_id.values(), key=lambda item: item["id"]):
             event_rows.append((
                 _delete_event_id("scene.node_delete", row["id"], float(row["created_at"])),
                 "scene.node_delete", now, "projection", None, _json({"id": row["id"]}),
@@ -463,6 +576,15 @@ def get_events(after: int, limit: int = 1000) -> list[dict[str, Any]]:
                 (max(0, after), safe_limit),
             )
         ]
+
+
+def get_cursor_timestamp(sequence: int) -> float:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT occurred_at FROM events WHERE sequence <= ? ORDER BY sequence DESC LIMIT 1",
+            (max(0, sequence),),
+        ).fetchone()
+    return float(row["occurred_at"]) if row else 0.0
 
 
 def get_timeline_range(seconds: float | None = None) -> dict[str, Any]:

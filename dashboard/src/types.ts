@@ -36,8 +36,23 @@ export interface SceneEdge {
 export interface SceneSnapshot {
   schemaVersion: number;
   cursor: number;
+  asOf?: number;
+  historical?: boolean;
   nodes: SceneNode[];
   edges: SceneEdge[];
+}
+
+export type ToolDirection = "vault" | "external" | "local";
+
+export interface ToolRoutingRule {
+  tool: string;
+  direction: ToolDirection;
+  referenceField: string;
+}
+
+export interface GraphPreferences {
+  theme: GraphTheme;
+  toolRules: ToolRoutingRule[];
 }
 
 export interface GraphTheme {
@@ -105,3 +120,5 @@ export const DEFAULT_THEME: GraphTheme = {
   jumpTargetBrightness: 2.3,
   background: "#02030a",
 };
+
+export const DEFAULT_TOOL_RULES: ToolRoutingRule[] = [];

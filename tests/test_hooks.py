@@ -148,6 +148,50 @@ class HookTests(unittest.TestCase):
         called = [edge for edge in snapshot["edges"] if edge["kind"] == "called"]
         self.assertIn("createdAt", called[0]["metadata"])
 
+    def test_user_rule_overrides_search_heuristic_and_maps_formatted_path(self):
+        storage.replace_vault_projection(
+            "/vault",
+            [
+                {
+                    "id": "note:example",
+                    "label": "Example",
+                    "metadata": {"path": "projects/example.md", "vault": "vault"},
+                    "links": [],
+                    "mtime_ns": 1,
+                }
+            ],
+            [],
+        )
+        storage.set_setting(
+            "graph_preferences",
+            {
+                "theme": {},
+                "toolRules": [
+                    {
+                        "tool": "community_doc_search",
+                        "direction": "vault",
+                        "referenceField": "path",
+                    }
+                ],
+            },
+        )
+
+        hooks.make_observer("post_tool_call")(
+            session_id="session-1",
+            tool_name="community_doc_search",
+            result="# Results\n\n> Path: projects/example.md\n> Score: 0.91",
+        )
+
+        snapshot = storage.get_snapshot()
+        tool = next(node for node in snapshot["nodes"] if node["kind"] == "tool")
+        retrieved = [edge for edge in snapshot["edges"] if edge["kind"] == "retrieved"]
+        results = [node for node in snapshot["nodes"] if node["kind"] == "result"]
+
+        self.assertEqual(tool["metadata"]["direction"], "vault")
+        self.assertEqual(tool["metadata"]["referenceField"], "path")
+        self.assertEqual([edge["target"] for edge in retrieved], ["note:example"])
+        self.assertEqual(results, [])
+
 
 if __name__ == "__main__":
     unittest.main()

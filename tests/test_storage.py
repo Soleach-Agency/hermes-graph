@@ -196,6 +196,39 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(removed["nodes"], ["result:1"])
 
+    def test_completed_owner_tools_retire_before_runtime_nodes(self):
+        storage.set_setting(
+            "graph_preferences",
+            {"theme": {"kanbanFadeHours": 6}, "toolRules": []},
+        )
+        storage.upsert_node(
+            "session:1",
+            "session",
+            "Session",
+            status="completed",
+            metadata={"completedAt": 100.0},
+        )
+        storage.upsert_node("agent:1", "agent", "Agent", status="active")
+        storage.upsert_node(
+            "tool:1",
+            "tool",
+            "Tool",
+            metadata={"owner": "agent:1", "direction": "local"},
+        )
+        storage.upsert_edge(
+            "belongs:1", "agent:1", "session:1", "belongs_to"
+        )
+
+        tool_deadline = 100.0 + 6 * 3600 * 0.3
+        first = storage.cleanup_expired(now=tool_deadline)
+        self.assertEqual(first["nodes"], ["tool:1"])
+        self.assertEqual(first["edges"], [])
+
+        owner_deadline = 100.0 + 6 * 3600
+        second = storage.cleanup_expired(now=owner_deadline)
+        self.assertEqual(second["nodes"], ["agent:1", "session:1"])
+        self.assertEqual(second["edges"], ["belongs:1"])
+
 
 class ProfileStoragePathTests(unittest.TestCase):
     def test_profile_home_resolves_to_shared_machine_database(self):

@@ -45,7 +45,7 @@ class PluginPackageTests(unittest.TestCase):
                 in_hooks = False
 
         self.assertIn("name: hermes-graph", text)
-        self.assertIn('version: "0.1.1"', text)
+        self.assertIn('version: "0.2.0"', text)
         self.assertIn("manifest_version: 1", text)
         self.assertIn("api_version: 1", text)
         self.assertEqual(set(declared_hooks), set(HOOKS))
