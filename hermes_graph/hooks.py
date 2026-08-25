@@ -180,13 +180,14 @@ def _result_references(
     if depth > 4:
         return []
     if isinstance(value, str):
-        if depth == 0 and len(value) <= 1_000_000:
-            try:
-                return _result_references(json.loads(value), depth + 1, reference_field)
-            except (TypeError, ValueError):
-                field = (reference_field or "").casefold().strip()
-                if not field:
-                    return []
+        if len(value) <= 1_000_000:
+            if depth == 0:
+                try:
+                    return _result_references(json.loads(value), depth + 1, reference_field)
+                except (TypeError, ValueError):
+                    pass
+            field = (reference_field or "").casefold().strip()
+            if field:
                 localized_labels = {
                     "path": {"path", "yol"},
                     "file": {"file", "dosya"},
@@ -205,7 +206,10 @@ def _result_references(
                             found.append(candidate)
                     if len(found) >= 20:
                         break
-                return found
+                if found or len(value) > 500:
+                    return found
+        if reference_field:
+            return []
         return [value] if len(value) <= 500 else []
     if isinstance(value, (list, tuple)):
         found: list[str] = []
@@ -224,7 +228,9 @@ def _result_references(
         for key, item in value.items():
             if str(key).lower() in reference_keys and isinstance(item, str) and len(item) <= 500:
                 found.append(item)
-            elif isinstance(item, (dict, list, tuple)):
+            elif isinstance(item, (dict, list, tuple)) or (
+                reference_field and isinstance(item, str)
+            ):
                 found.extend(_result_references(item, depth + 1, reference_field))
             if len(found) >= 20:
                 break

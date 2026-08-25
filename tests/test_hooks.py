@@ -192,6 +192,61 @@ class HookTests(unittest.TestCase):
         self.assertEqual([edge["target"] for edge in retrieved], ["note:example"])
         self.assertEqual(results, [])
 
+    def test_user_rule_maps_formatted_path_inside_mcp_content_envelope(self):
+        storage.replace_vault_projection(
+            "/vault",
+            [
+                {
+                    "id": "note:example",
+                    "label": "Example",
+                    "metadata": {"path": "projects/example.md", "vault": "vault"},
+                    "links": [],
+                    "mtime_ns": 1,
+                }
+            ],
+            [],
+        )
+        storage.set_setting(
+            "graph_preferences",
+            {
+                "theme": {},
+                "toolRules": [
+                    {
+                        "tool": "mcp__community__doc_search",
+                        "direction": "vault",
+                        "referenceField": "path",
+                    }
+                ],
+            },
+        )
+
+        hooks.make_observer("post_tool_call")(
+            session_id="session-1",
+            tool_name="mcp__community__doc_search",
+            result={
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "# Reference material\n\n"
+                            "> Yol: projects/example.md\n"
+                            "> Benzerlik: 0.91\n"
+                            "> This body must not become a node"
+                        ),
+                    }
+                ]
+            },
+        )
+
+        snapshot = storage.get_snapshot()
+        tool = next(node for node in snapshot["nodes"] if node["kind"] == "tool")
+        retrieved = [edge for edge in snapshot["edges"] if edge["kind"] == "retrieved"]
+        results = [node for node in snapshot["nodes"] if node["kind"] == "result"]
+
+        self.assertEqual(tool["metadata"]["direction"], "vault")
+        self.assertEqual([edge["target"] for edge in retrieved], ["note:example"])
+        self.assertEqual(results, [])
+
 
 if __name__ == "__main__":
     unittest.main()
