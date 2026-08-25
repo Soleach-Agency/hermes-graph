@@ -48,5 +48,5 @@ worktree. `UNVERIFIED` is intentionally not a pass.
 - [x] The operator reran every formerly unavailable live-host cell and recorded the
   observed result without treating missing evidence as a pass.
 - [x] Create the `v0.1.0` repository release.
-- [ ] Obtain explicit authorization to change repository visibility from private to
-  public, then verify anonymous access and the public installation URL.
+- [x] Owner explicitly authorized changing repository visibility from private to
+  public; anonymous Git and release access were verified on 2026-08-25.

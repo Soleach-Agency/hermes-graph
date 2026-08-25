@@ -16,8 +16,8 @@ Hermes Graph therefore uses the portable v1 manifest and keeps `api_version: 1`.
   `hermes plugins install Soleach-Agency/hermes-graph --ref <commit> --no-enable`.
 - [x] Native doctor passes against the freshly installed temporary copy:
   Hermes Graph 0.1.1, zero tools, 14 hooks.
-- [ ] Anonymous Git access sees release tag `v0.1.1` and the exact tagged commit
-  installs and passes native doctor.
-- [ ] The tested commit is tagged and published as GitHub release `v0.1.1`.
+- [x] Anonymous Git access sees release tag `v0.1.1`; exact tagged commit
+  `d2a373baac0cf4db195bf596428ef01dd5e7d4bf` installs and passes native doctor.
+- [x] The tested commit is tagged and published as GitHub release `v0.1.1`.
 
 The `v0.1.0` tag remains immutable and records the original release candidate.
