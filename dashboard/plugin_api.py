@@ -21,7 +21,7 @@ from hermes_graph.storage import (  # noqa: E402
     get_snapshot_at,
     get_timeline_range,
 )
-from hermes_graph.vault import index_vault, vault_status  # noqa: E402
+from hermes_graph.vault import configure_vault, vault_status  # noqa: E402
 
 
 router = APIRouter()
@@ -61,7 +61,7 @@ async def vault():
 @router.post("/vault/configure")
 async def configure_vault(configuration: VaultConfiguration):
     try:
-        return await asyncio.to_thread(index_vault, configuration.path)
+        return await asyncio.to_thread(configure_vault, configuration.path)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
