@@ -137,11 +137,15 @@ def sync_vault_change(path_value: str | Path, path: str | Path, previous_path: s
     """Apply one filesystem change without a full vault scan or rewrite."""
     root = Path(path_value).expanduser().resolve()
     current = Path(path)
-    current = current if current.is_absolute() else root / current
+    current = (current if current.is_absolute() else root / current).resolve()
     old_relative = None
     if previous_path:
         previous = Path(previous_path)
-        old_relative = previous.relative_to(root).as_posix() if previous.is_absolute() else previous.as_posix()
+        previous = (previous if previous.is_absolute() else root / previous).resolve()
+        try:
+            old_relative = previous.relative_to(root).as_posix()
+        except ValueError:
+            return False
     document = _document(root, current)
     if document is None and old_relative is None:
         try:

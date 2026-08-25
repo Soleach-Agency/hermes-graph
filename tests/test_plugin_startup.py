@@ -21,7 +21,7 @@ class FakeContext:
 
 
 class PluginStartupTests(unittest.TestCase):
-    def test_register_hydrates_runtime_after_observer_hooks_are_registered(self):
+    def test_register_hydrates_runtime_and_kanban_after_observer_hooks(self):
         module_name = "_hermes_graph_plugin_startup_fixture"
         spec = importlib.util.spec_from_file_location(
             module_name,
@@ -35,13 +35,16 @@ class PluginStartupTests(unittest.TestCase):
         try:
             spec.loader.exec_module(module)
             context = FakeContext()
-            with patch.object(module, "hydrate_runtime") as hydrate:
+            with patch.object(module, "hydrate_runtime") as hydrate_runtime, patch.object(
+                module, "hydrate_kanban"
+            ) as hydrate_kanban:
                 module.register(context)
         finally:
             sys.modules.pop(module_name, None)
 
         self.assertEqual(len(context.callbacks), 14)
-        hydrate.assert_called_once_with(profile_name="luna")
+        hydrate_runtime.assert_called_once_with(profile_name="luna")
+        hydrate_kanban.assert_called_once_with()
 
 
 if __name__ == "__main__":
