@@ -69,10 +69,18 @@ class PlaybackPreferences(BaseModel):
     )
 
 
+class TimelapseAnimationPreferences(BaseModel):
+    jumpDurationSeconds: float = Field(default=1, ge=0.1, le=10)
+    fadeDurationSeconds: float = Field(default=2, ge=0.2, le=10)
+
+
 class GraphPreferences(BaseModel):
     theme: dict[str, Any]
     toolRules: list[ToolRoutingRule]
     playback: PlaybackPreferences = Field(default_factory=PlaybackPreferences)
+    timelapse: TimelapseAnimationPreferences = Field(
+        default_factory=TimelapseAnimationPreferences
+    )
 
 
 @router.get("/snapshot")
@@ -120,6 +128,7 @@ async def settings():
             "theme": {},
             "toolRules": [],
             "playback": _model_payload(PlaybackPreferences()),
+            "timelapse": _model_payload(TimelapseAnimationPreferences()),
         },
     )
 
@@ -144,6 +153,7 @@ async def save_settings(preferences: GraphPreferences):
         "theme": preferences.theme,
         "toolRules": rules,
         "playback": _model_payload(preferences.playback),
+        "timelapse": _model_payload(preferences.timelapse),
     }
     await asyncio.to_thread(set_setting, "graph_preferences", value)
     return value

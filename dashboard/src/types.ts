@@ -54,6 +54,7 @@ export interface GraphPreferences {
   theme: GraphTheme;
   toolRules: ToolRoutingRule[];
   playback: PlaybackPreferences;
+  timelapse: TimelapseAnimationPreferences;
 }
 
 export type PlaybackMode = "fixed-duration" | "per-source-hour";
@@ -68,6 +69,11 @@ export interface PlaybackPreferences {
   mode: PlaybackMode;
   fixedDuration: PlaybackDurationSetting;
   perSourceHour: PlaybackDurationSetting;
+}
+
+export interface TimelapseAnimationPreferences {
+  jumpDurationSeconds: number;
+  fadeDurationSeconds: number;
 }
 
 export interface GraphTheme {
@@ -142,4 +148,9 @@ export const DEFAULT_PLAYBACK: PlaybackPreferences = {
   mode: "fixed-duration",
   fixedDuration: { value: 24, unit: "seconds" },
   perSourceHour: { value: 1, unit: "seconds" },
+};
+
+export const DEFAULT_TIMELAPSE: TimelapseAnimationPreferences = {
+  jumpDurationSeconds: 1,
+  fadeDurationSeconds: 2,
 };

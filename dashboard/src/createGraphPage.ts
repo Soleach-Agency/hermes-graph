@@ -1,5 +1,6 @@
 import { createDemoSnapshot, DEMO_TIMELINE_CURSOR } from "./demo";
 import { GraphScene } from "./GraphScene";
+import { mergeTimelapseAnimation } from "./routeAnimation";
 import { interpolatePlaybackCursor, resolvePlaybackDurationMs } from "./timeline";
 import {
   DEFAULT_PLAYBACK,
@@ -13,6 +14,7 @@ import {
   type PlaybackPreferences,
   type SceneNode,
   type SceneSnapshot,
+  type TimelapseAnimationPreferences,
   type ToolRoutingRule,
 } from "./types";
 
@@ -134,16 +136,21 @@ function loadLocalPreferences(): GraphPreferences {
     const playback = JSON.parse(
       localStorage.getItem("hermes-graph:playback") || "null",
     ) as Partial<PlaybackPreferences> | null;
+    const timelapse = JSON.parse(
+      localStorage.getItem("hermes-graph:timelapse") || "null",
+    ) as Partial<TimelapseAnimationPreferences> | null;
     return {
       theme: mergeTheme(saved),
       toolRules: [...DEFAULT_TOOL_RULES],
       playback: mergePlayback(playback),
+      timelapse: mergeTimelapseAnimation(timelapse),
     };
   } catch {
     return {
       theme: mergeTheme(),
       toolRules: [...DEFAULT_TOOL_RULES],
       playback: mergePlayback(),
+      timelapse: mergeTimelapseAnimation(),
     };
   }
 }
@@ -186,6 +193,9 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     );
     const [playback, setPlayback] = React.useState<PlaybackPreferences>(
       initialPreferencesRef.current.playback,
+    );
+    const [timelapse, setTimelapse] = React.useState<TimelapseAnimationPreferences>(
+      initialPreferencesRef.current.timelapse,
     );
     const [knownTools, setKnownTools] = React.useState<string[]>([]);
     const [settingsBusy, setSettingsBusy] = React.useState(false);
@@ -269,6 +279,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         onStats: (next) =>
           setStats((current) => ({ ...next, fps: next.fps || current.fps })),
         theme: initialPreferencesRef.current.theme,
+        timelapse: initialPreferencesRef.current.timelapse,
       });
       sceneRef.current = scene;
       void loadSnapshot();
@@ -350,10 +361,13 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           const nextTheme = mergeTheme(saved.theme);
           const nextRules = Array.isArray(saved.toolRules) ? saved.toolRules : [];
           const nextPlayback = mergePlayback(saved.playback);
+          const nextTimelapse = mergeTimelapseAnimation(saved.timelapse);
           setTheme(nextTheme);
           setToolRules(nextRules);
           setPlayback(nextPlayback);
+          setTimelapse(nextTimelapse);
           sceneRef.current?.setTheme(nextTheme);
+          sceneRef.current?.setTimelapseAnimation(nextTimelapse);
           setSettingsMessage("SAVED ON SERVER");
         })
         .catch(() => setSettingsMessage("LOCAL FALLBACK"));
@@ -570,6 +584,13 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       sceneRef.current?.setTheme(next);
     };
 
+    const previewTimelapse = (patch: Partial<TimelapseAnimationPreferences>) => {
+      const next = mergeTimelapseAnimation({ ...timelapse, ...patch });
+      setTimelapse(next);
+      setSettingsMessage("UNSAVED CHANGES");
+      sceneRef.current?.setTimelapseAnimation(next);
+    };
+
     const setTypeColor = (kind: string, color: string) => {
       previewTheme({
         ...theme,
@@ -632,16 +653,20 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         const saved = await fetchJSON<GraphPreferences>("/api/plugins/hermes-graph/settings", {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ theme, toolRules, playback }),
+          body: JSON.stringify({ theme, toolRules, playback, timelapse }),
         });
         const nextTheme = mergeTheme(saved.theme);
         const nextPlayback = mergePlayback(saved.playback);
+        const nextTimelapse = mergeTimelapseAnimation(saved.timelapse);
         setTheme(nextTheme);
         setToolRules(saved.toolRules || []);
         setPlayback(nextPlayback);
+        setTimelapse(nextTimelapse);
         localStorage.setItem("hermes-graph:theme", JSON.stringify(nextTheme));
         localStorage.setItem("hermes-graph:playback", JSON.stringify(nextPlayback));
+        localStorage.setItem("hermes-graph:timelapse", JSON.stringify(nextTimelapse));
         sceneRef.current?.setTheme(nextTheme);
+        sceneRef.current?.setTimelapseAnimation(nextTimelapse);
         setSettingsMessage("SAVED ON SERVER");
       } catch (error) {
         setSettingsMessage(error instanceof Error ? "SAVE FAILED" : "ERROR");
@@ -930,6 +955,46 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
                 }),
             }),
           ),
+          h("div", { className: "hg-settings-title hg-pressure-title" }, "TIMELAPSE ANIMATION"),
+          h(
+            "div",
+            { className: "hg-tool-help" },
+            "Animation timing stays constant even when the selected timeline plays faster.",
+          ),
+          h(
+            "label",
+            { className: "hg-scale-row" },
+            h("span", null, `jump duration ${timelapse.jumpDurationSeconds.toFixed(1)}s`),
+            h("input", {
+              type: "range",
+              min: 0.1,
+              max: 10,
+              step: 0.1,
+              value: timelapse.jumpDurationSeconds,
+              "aria-label": "Timelapse jump duration seconds",
+              onChange: (event: Event) =>
+                previewTimelapse({
+                  jumpDurationSeconds: Number((event.target as HTMLInputElement).value),
+                }),
+            }),
+          ),
+          h(
+            "label",
+            { className: "hg-scale-row" },
+            h("span", null, `fade duration ${timelapse.fadeDurationSeconds.toFixed(1)}s`),
+            h("input", {
+              type: "range",
+              min: 0.2,
+              max: 10,
+              step: 0.1,
+              value: timelapse.fadeDurationSeconds,
+              "aria-label": "Timelapse fade duration seconds",
+              onChange: (event: Event) =>
+                previewTimelapse({
+                  fadeDurationSeconds: Number((event.target as HTMLInputElement).value),
+                }),
+            }),
+          ),
           h("div", { className: "hg-settings-title hg-pressure-title" }, "ACTIVITY ROUTING"),
           h(
             "div",
@@ -963,43 +1028,6 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
                 previewTheme({
                   ...theme,
                   activityHopCount: Number((event.target as HTMLInputElement).value),
-                }),
-            }),
-          ),
-          h(
-            "label",
-            { className: "hg-scale-row" },
-            h("span", null, `hop delay ${theme.activityHopDelayMs}ms`),
-            h("input", {
-              type: "range",
-              min: 5,
-              max: 100,
-              step: 5,
-              value: theme.activityHopDelayMs,
-              disabled: theme.activityMode !== "beautiful",
-              "aria-label": "Beautiful route hop delay",
-              onChange: (event: Event) =>
-                previewTheme({
-                  ...theme,
-                  activityHopDelayMs: Number((event.target as HTMLInputElement).value),
-                }),
-            }),
-          ),
-          h(
-            "label",
-            { className: "hg-scale-row" },
-            h("span", null, `route lifetime ${theme.activityTtlSeconds}s`),
-            h("input", {
-              type: "range",
-              min: 10,
-              max: 90,
-              step: 5,
-              value: theme.activityTtlSeconds,
-              "aria-label": "Activity route lifetime",
-              onChange: (event: Event) =>
-                previewTheme({
-                  ...theme,
-                  activityTtlSeconds: Number((event.target as HTMLInputElement).value),
                 }),
             }),
           ),

@@ -10,11 +10,17 @@ import { computeSpatialLayout, type Position } from "./layout";
 import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
 import { isActivityEdge, isPersistentEdge } from "./edgePolicy";
 import {
+  mergeTimelapseAnimation,
+  resolveRouteAnimationFrame,
+} from "./routeAnimation";
+import {
+  DEFAULT_TIMELAPSE,
   DEFAULT_THEME,
   type GraphTheme,
   type SceneEdge,
   type SceneNode,
   type SceneSnapshot,
+  type TimelapseAnimationPreferences,
 } from "./types";
 
 const vertexShader = `
@@ -102,16 +108,17 @@ export interface GraphSceneOptions {
   onHover?: (node: SceneNode | null, x: number, y: number) => void;
   onStats?: (stats: { nodes: number; edges: number; fps: number }) => void;
   theme?: Partial<GraphTheme>;
+  timelapse?: Partial<TimelapseAnimationPreferences>;
 }
 
 interface ActiveRoute {
+  key: string;
   line: Line2;
   marker: THREE.Sprite;
   path: RoutePoint[];
   startedAt: number;
-  hopDelay: number;
   vertexCount: number;
-  ttl: number;
+  timing: TimelapseAnimationPreferences;
 }
 
 interface RoutePoint {
@@ -136,6 +143,7 @@ export class GraphScene {
   private readonly pointer = new THREE.Vector2(2, 2);
   private readonly resizeObserver: ResizeObserver;
   private theme: GraphTheme;
+  private timelapse: TimelapseAnimationPreferences;
   private readonly onHover?: GraphSceneOptions["onHover"];
   private readonly onStats?: GraphSceneOptions["onStats"];
   private points: THREE.Points | null = null;
@@ -147,10 +155,7 @@ export class GraphScene {
   private nodes: SceneNode[] = [];
   private snapshot: SceneSnapshot | null = null;
   private activeRoutes: ActiveRoute[] = [];
-  private readonly activityRouteTiming = new Map<
-    string,
-    { startedAt: number; lastSeenAt: number }
-  >();
+  private readonly activityRouteSeenAt = new Map<string, number>();
   private animationFrame = 0;
   private hoverFrame = 0;
   private lastHovered = -1;
@@ -164,6 +169,7 @@ export class GraphScene {
       nodeColors: { ...DEFAULT_THEME.nodeColors, ...options.theme?.nodeColors },
       kanbanColors: { ...DEFAULT_THEME.kanbanColors, ...options.theme?.kanbanColors },
     };
+    this.timelapse = mergeTimelapseAnimation(options.timelapse || DEFAULT_TIMELAPSE);
     this.onHover = options.onHover;
     this.onStats = options.onStats;
     this.renderer = new THREE.WebGLRenderer({
@@ -262,6 +268,10 @@ export class GraphScene {
     this.transitionDuration = Math.max(0.08, Math.min(3, seconds));
   }
 
+  setTimelapseAnimation(timing: Partial<TimelapseAnimationPreferences>): void {
+    this.timelapse = mergeTimelapseAnimation({ ...this.timelapse, ...timing });
+  }
+
   dispose(): void {
     cancelAnimationFrame(this.animationFrame);
     cancelAnimationFrame(this.hoverFrame);
@@ -269,6 +279,7 @@ export class GraphScene {
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerleave", this.handlePointerLeave);
     this.disposeGraph();
+    this.disposeActivityRoutes();
     this.controls.dispose();
     this.renderer.dispose();
     this.jumpTexture.dispose();
@@ -494,20 +505,25 @@ export class GraphScene {
       })
       .slice(0, 20);
     const sceneNow = this.clock.elapsedTime;
+    const activeByKey = new Map(this.activeRoutes.map((route) => [route.key, route]));
     const plannedStarts = new Map<string, number>();
     const toolReadyAt = new Map<string, number>();
     const timingKeyFor = (edge: SceneEdge) =>
       `${edge.id}:${Number(edge.metadata?.createdAt || 0)}`;
     activityEdges.forEach((edge, index) => {
       if (edge.kind !== "called") return;
-      const existing = this.activityRouteTiming.get(timingKeyFor(edge));
+      const existing = activeByKey.get(timingKeyFor(edge));
       const start = existing?.startedAt ?? sceneNow + index * 0.012;
       plannedStarts.set(edge.id, start);
-      toolReadyAt.set(edge.target, start + 0.07);
+      toolReadyAt.set(
+        edge.target,
+        start +
+          (existing?.timing.jumpDurationSeconds ?? this.timelapse.jumpDurationSeconds),
+      );
     });
     activityEdges.forEach((edge, index) => {
       if (plannedStarts.has(edge.id)) return;
-      const existing = this.activityRouteTiming.get(timingKeyFor(edge));
+      const existing = activeByKey.get(timingKeyFor(edge));
       const naturalStart = sceneNow + index * 0.012;
       plannedStarts.set(
         edge.id,
@@ -516,6 +532,15 @@ export class GraphScene {
     });
 
     activityEdges.forEach((edge) => {
+      const timingKey = timingKeyFor(edge);
+      const existingRoute = activeByKey.get(timingKey);
+      const seenBefore = this.activityRouteSeenAt.has(timingKey);
+      this.activityRouteSeenAt.set(timingKey, sceneNow);
+      if (existingRoute) {
+        this.markRouteJumpWindows(nodeIndex, existingRoute, edge.kind);
+        return;
+      }
+      if (seenBefore) return;
       const source = positions.get(edge.source);
       const target = positions.get(edge.target);
       if (!source || !target) return;
@@ -564,38 +589,49 @@ export class GraphScene {
       marker.visible = false;
       this.scene.add(line);
       this.scene.add(marker);
-      const timingKey = timingKeyFor(edge);
-      const existingTiming = this.activityRouteTiming.get(timingKey);
-      const startedAt = existingTiming?.startedAt ?? plannedStarts.get(edge.id)!;
-      this.activityRouteTiming.set(timingKey, { startedAt, lastSeenAt: sceneNow });
-      const hopDelay =
-        path.length <= 2
-          ? 0.07
-          : Math.max(0.008, this.theme.activityHopDelayMs / 1000);
-      this.activeRoutes.push({
+      const route: ActiveRoute = {
+        key: timingKey,
         line,
         marker,
         path,
-        startedAt,
-        hopDelay,
+        startedAt: plannedStarts.get(edge.id)!,
         vertexCount: path.length,
-        ttl: this.theme.activityTtlSeconds,
-      });
-      const completion = startedAt + (path.length - 1) * hopDelay;
-      if (["retrieved", "returned"].includes(edge.kind)) {
-        this.markJumpWindow(nodeIndex, edge.source, startedAt, completion + 0.18);
-      }
-      for (let pathIndex = 1; pathIndex < path.length; pathIndex += 1) {
-        const arrival = startedAt + pathIndex * hopDelay;
-        const isFinal = pathIndex === path.length - 1;
-        const hold = isFinal ? 0.55 : Math.max(0.14, hopDelay * 3.5);
-        this.markJumpWindow(nodeIndex, path[pathIndex].id, arrival, arrival + hold);
-      }
+        timing: { ...this.timelapse },
+      };
+      this.activeRoutes.push(route);
+      activeByKey.set(timingKey, route);
+      this.markRouteJumpWindows(nodeIndex, route, edge.kind);
     });
-    for (const [key, timing] of this.activityRouteTiming) {
-      if (sceneNow - timing.lastSeenAt > this.theme.activityTtlSeconds + 2) {
-        this.activityRouteTiming.delete(key);
+    for (const [key, lastSeenAt] of this.activityRouteSeenAt) {
+      if (sceneNow - lastSeenAt > this.theme.activityTtlSeconds + 12) {
+        this.activityRouteSeenAt.delete(key);
       }
+    }
+  }
+
+  private markRouteJumpWindows(
+    nodeIndex: Map<string, number>,
+    route: ActiveRoute,
+    edgeKind?: string,
+  ): void {
+    const segmentCount = Math.max(1, route.vertexCount - 1);
+    const hopDuration = route.timing.jumpDurationSeconds / segmentCount;
+    const completion = route.startedAt + route.timing.jumpDurationSeconds;
+    if (["retrieved", "returned"].includes(edgeKind || "")) {
+      this.markJumpWindow(
+        nodeIndex,
+        route.path[0].id,
+        route.startedAt,
+        completion + route.timing.fadeDurationSeconds,
+      );
+    }
+    for (let pathIndex = 1; pathIndex < route.path.length; pathIndex += 1) {
+      const arrival = route.startedAt + pathIndex * hopDuration;
+      const isFinal = pathIndex === route.path.length - 1;
+      const hold = isFinal
+        ? route.timing.fadeDurationSeconds
+        : Math.max(0.14, hopDuration * 1.5);
+      this.markJumpWindow(nodeIndex, route.path[pathIndex].id, arrival, arrival + hold);
     }
   }
 
@@ -673,15 +709,23 @@ export class GraphScene {
   }
 
   private updateActivityRoutes(now: number): void {
+    const retained: ActiveRoute[] = [];
     for (const route of this.activeRoutes) {
       const elapsed = now - route.startedAt;
+      const segmentCount = route.vertexCount - 1;
+      const frame = resolveRouteAnimationFrame(elapsed, segmentCount, route.timing);
+      if (frame.complete) {
+        this.disposeActivityRoute(route);
+        continue;
+      }
+      retained.push(route);
       if (elapsed < 0) {
         route.line.geometry.instanceCount = 0;
+        route.line.visible = false;
         route.marker.visible = false;
         continue;
       }
-      const segmentCount = route.vertexCount - 1;
-      const segmentProgress = elapsed / route.hopDelay;
+      const segmentProgress = frame.segmentProgress;
       const completedSegments = Math.min(segmentCount, Math.floor(segmentProgress));
       route.line.geometry.instanceCount = completedSegments;
       if (completedSegments < segmentCount) {
@@ -698,12 +742,11 @@ export class GraphScene {
       } else {
         route.marker.visible = false;
       }
-      const completion = (route.vertexCount - 1) * route.hopDelay;
-      const linger = elapsed - completion;
-      route.line.material.opacity = linger <= 0 ? 0.38 : Math.max(0, 0.38 * (1 - linger / route.ttl));
-      route.line.visible = linger < route.ttl;
-      route.marker.material.opacity = linger <= 0 ? 0.95 : 0;
+      route.line.material.opacity = frame.lineOpacity;
+      route.line.visible = frame.visible;
+      route.marker.material.opacity = elapsed <= route.timing.jumpDurationSeconds ? 0.95 : 0;
     }
+    this.activeRoutes = retained;
   }
 
   private readonly handlePointerMove = (event: PointerEvent): void => {
@@ -796,14 +839,6 @@ export class GraphScene {
   };
 
   private disposeGraph(): void {
-    for (const route of this.activeRoutes) {
-      this.scene.remove(route.line);
-      this.scene.remove(route.marker);
-      route.line.geometry.dispose();
-      route.line.material.dispose();
-      route.marker.material.dispose();
-    }
-    this.activeRoutes = [];
     if (this.points) {
       this.scene.remove(this.points);
       this.points.geometry.dispose();
@@ -816,5 +851,18 @@ export class GraphScene {
       (this.edges.material as THREE.Material).dispose();
       this.edges = null;
     }
+  }
+
+  private disposeActivityRoute(route: ActiveRoute): void {
+    this.scene.remove(route.line);
+    this.scene.remove(route.marker);
+    route.line.geometry.dispose();
+    route.line.material.dispose();
+    route.marker.material.dispose();
+  }
+
+  private disposeActivityRoutes(): void {
+    for (const route of this.activeRoutes) this.disposeActivityRoute(route);
+    this.activeRoutes = [];
   }
 }
