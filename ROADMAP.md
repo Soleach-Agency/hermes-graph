@@ -25,15 +25,17 @@ Hermes 0.20.5-compatible `v0.1.1` package. The historical evidence is retained i
 
 The `0.2.0` candidate on `codex/lifecycle-settings` adds completed runtime
 retirement, owned-tool-first fade sequencing, persistent visual preferences,
-editable tool routing overrides, configurable Vault result-field mapping, and
-generic extraction from nested MCP text envelopes. Community defaults contain
-no Soleach- or vendor-specific tool rules. Local verification currently covers
-40 backend tests, three frontend tests, and the production build. Live Soleach
-validation resolved three RAG result paths to three real Vault nodes and emitted
-three temporary `retrieved` edges. All seven Soleach profile-local plugin copies
-carry the verified hotfix checksum; Dashboard and Gateway were active after the
-final restart without interrupting the independently scoped worker that was
-already running.
+editable tool routing overrides, configurable Vault result-field mapping,
+generic extraction from nested MCP text envelopes, freely draggable timeline
+scrubbing, frame-driven playback with overlapping easing, and stable runtime
+placement that puts new owners into open space without displacing existing ones.
+Community defaults contain no Soleach- or vendor-specific tool rules. Local
+verification currently covers 40 backend tests, eight frontend tests, and the
+production build. Live Soleach validation resolved three RAG result paths to
+three real Vault nodes and emitted three temporary `retrieved` edges. All seven
+Soleach profile-local plugin copies carry the exact current candidate commit;
+Dashboard was restarted independently while Gateway and its running work stayed
+untouched.
 
 ## Next data-fidelity work
 
