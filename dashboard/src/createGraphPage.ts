@@ -210,10 +210,20 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       [],
     );
 
-    const loadSnapshot = React.useCallback(async (at?: number, updateView = true) => {
+    const loadSnapshot = React.useCallback(async (
+      at?: number,
+      updateView = true,
+      activityAfter?: number,
+    ) => {
       const requestId = ++snapshotRequestRef.current;
       try {
-        const suffix = at === undefined ? "" : `?at=${Math.max(0, Math.round(at))}`;
+        const suffix = at === undefined
+          ? ""
+          : `?at=${Math.max(0, Math.round(at))}${
+              activityAfter === undefined
+                ? ""
+                : `&activityAfter=${Math.max(0, Math.round(activityAfter))}`
+            }`;
         const snapshot = await fetchJSON<SceneSnapshot>(
           `/api/plugins/hermes-graph/snapshot${suffix}`,
         );
@@ -378,6 +388,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       const startedAt = performance.now();
       const durationMs = playbackDurationMsRef.current;
       let lastSnapshotAt = -snapshotCadenceMs;
+      let activityAfterCursor = startCursor;
       let frame = 0;
       let disposed = false;
 
@@ -401,9 +412,13 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
             sceneRef.current?.setSnapshot(createDemoSnapshot(demoCountRef.current, next));
           } else {
             playbackLoadingRef.current = true;
-            void loadSnapshot(next, false).finally(() => {
-              playbackLoadingRef.current = false;
-            });
+            void loadSnapshot(next, false, activityAfterCursor)
+              .then((snapshot) => {
+                if (snapshot) activityAfterCursor = snapshot.cursor;
+              })
+              .finally(() => {
+                playbackLoadingRef.current = false;
+              });
           }
         }
 

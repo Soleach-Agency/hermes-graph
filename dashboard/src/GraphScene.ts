@@ -8,7 +8,7 @@ import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeome
 
 import { computeSpatialLayout, type Position } from "./layout";
 import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
-import { isActivityEdge, isPersistentVaultEdge } from "./edgePolicy";
+import { isActivityEdge, isPersistentEdge } from "./edgePolicy";
 import {
   DEFAULT_THEME,
   type GraphTheme,
@@ -237,7 +237,7 @@ export class GraphScene {
     this.edges = this.createEdges(this.nodes, visibleEdges, positions);
     const byId = new Map(this.nodes.map((node) => [node.id, node]));
     this.edgeCount = visibleEdges.filter(
-      (edge) => isPersistentVaultEdge(edge, byId) || isActivityEdge(edge),
+      (edge) => isPersistentEdge(edge, byId) || isActivityEdge(edge),
     ).length;
     this.scene.add(this.edges, this.points);
     this.createActivityRoutes(this.nodes, visibleEdges, positions);
@@ -432,7 +432,7 @@ export class GraphScene {
     const byId = new Map(nodes.map((node) => [node.id, node]));
     const validEdges = edges.filter(
       (edge) =>
-        isPersistentVaultEdge(edge, byId) &&
+        isPersistentEdge(edge, byId) &&
         nodeIndex.has(edge.source) &&
         nodeIndex.has(edge.target),
     );
@@ -486,6 +486,11 @@ export class GraphScene {
         // Expiry is authoritative in the SQLite projection. This filter only
         // guards malformed snapshots; route animation itself is presentation.
         return Boolean(source) && Boolean(target);
+      })
+      .sort((left, right) => {
+        const delegationPriority = Number(right.kind === "delegated") - Number(left.kind === "delegated");
+        if (delegationPriority !== 0) return delegationPriority;
+        return Number(right.metadata?.createdAt || 0) - Number(left.metadata?.createdAt || 0);
       })
       .slice(0, 20);
     const sceneNow = this.clock.elapsedTime;

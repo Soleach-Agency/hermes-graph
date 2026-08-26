@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 PLUGIN_ID = "hermes-graph"
 _SCHEMA_LOCK = threading.Lock()
 _INITIALIZED_PATHS: set[Path] = set()
@@ -142,6 +142,11 @@ def ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
                 PRIMARY KEY (provenance, entity_kind, entity_id)
             );
 
+            CREATE TABLE IF NOT EXISTS agent_aliases (
+                alias_key TEXT PRIMARY KEY,
+                canonical_key TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -152,6 +157,30 @@ def ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
             "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        # Recover the durable execution-id -> session-id map. Older projections
+        # treated each task/turn id as a separate agent even when several turns
+        # belonged to the same Hermes session.
+        for row in conn.execute(
+            """
+            SELECT event_type, payload_json FROM events
+            WHERE event_type IN ('subagent_start', 'pre_api_request', 'pre_tool_call')
+            """
+        ):
+            try:
+                payload = json.loads(row["payload_json"])
+                if row["event_type"] == "subagent_start":
+                    alias_key = payload.get("child_subagent_id")
+                    canonical_key = payload.get("child_session_id")
+                else:
+                    alias_key = payload.get("task_id")
+                    canonical_key = payload.get("session_id")
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                continue
+            if alias_key and canonical_key:
+                conn.execute(
+                    "INSERT OR IGNORE INTO agent_aliases(alias_key, canonical_key) VALUES (?, ?)",
+                    (str(alias_key), str(canonical_key)),
+                )
         conn.commit()
         _INITIALIZED_PATHS.add(path)
 
@@ -182,6 +211,122 @@ def record_event(
             ).fetchone()
             return int(row["sequence"])
         return int(cursor.lastrowid)
+
+
+def register_agent_alias(alias_key: str, canonical_key: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO agent_aliases(alias_key, canonical_key) VALUES (?, ?) "
+            "ON CONFLICT(alias_key) DO UPDATE SET canonical_key = excluded.canonical_key",
+            (alias_key, canonical_key),
+        )
+
+
+def resolve_agent_key(key: Any) -> str:
+    raw = str(key or "unknown")
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT canonical_key FROM agent_aliases WHERE alias_key = ?", (raw,)
+        ).fetchone()
+    return str(row["canonical_key"]) if row else raw
+
+
+def get_node_kind(node_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT kind FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    return str(row["kind"]) if row else None
+
+
+def _agent_node_aliases(conn: sqlite3.Connection) -> dict[str, str]:
+    def agent_id(value: str) -> str:
+        digest = hashlib.sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+        return f"agent:{digest}"
+
+    return {
+        agent_id(str(row["alias_key"])): agent_id(str(row["canonical_key"]))
+        for row in conn.execute("SELECT alias_key, canonical_key FROM agent_aliases")
+    }
+
+
+def _canonicalize_scene(
+    nodes: dict[str, dict[str, Any]],
+    edges: dict[str, dict[str, Any]],
+    aliases: dict[str, str],
+) -> None:
+    """Collapse turn/runtime aliases into one actor per Hermes session."""
+    def entity_id(prefix: str, value: str) -> str:
+        digest = hashlib.sha1(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+        return f"{prefix}:{digest}"
+
+    # Runtime hydration deliberately has its own stored ids. At read time it
+    # joins the same canonical actor as live hook projections via sessionId.
+    for node_id, node in list(nodes.items()):
+        if node.get("kind") not in {"agent", "subagent"}:
+            continue
+        session_id = (node.get("metadata") or {}).get("sessionId")
+        if session_id:
+            aliases[node_id] = entity_id("agent", str(session_id))
+
+    # A tool is one satellite per canonical owner + tool name, not one copy per
+    # execution turn. This also repairs retained history without rewriting it.
+    for node_id, node in list(nodes.items()):
+        if node.get("kind") != "tool":
+            continue
+        metadata = node.get("metadata") or {}
+        owner = aliases.get(metadata.get("owner"), metadata.get("owner"))
+        if owner:
+            metadata["owner"] = owner
+            aliases[node_id] = entity_id("tool", f"{owner}:{node.get('label', 'tool')}")
+
+    terminal_statuses = {"blocked", "completed", "done", "failed", "reset", "stopped"}
+
+    def merge_node(canonical: dict[str, Any], incoming: dict[str, Any]) -> None:
+        canonical["metadata"] = {
+            **(incoming.get("metadata") or {}),
+            **(canonical.get("metadata") or {}),
+        }
+        if incoming.get("kind") == "subagent":
+            canonical["kind"] = "subagent"
+            canonical["label"] = incoming.get("label") or canonical.get("label")
+        if str(incoming.get("status", "")).lower() in terminal_statuses:
+            canonical["status"] = incoming["status"]
+        for key in ("color", "size", "pressure"):
+            if canonical.get(key) is None and incoming.get(key) is not None:
+                canonical[key] = incoming[key]
+
+    for alias_id, canonical_id in aliases.items():
+        if alias_id == canonical_id:
+            continue
+        alias = nodes.pop(alias_id, None)
+        if alias is None:
+            continue
+        canonical = nodes.get(canonical_id)
+        if canonical is None:
+            alias["id"] = canonical_id
+            nodes[canonical_id] = alias
+            continue
+        merge_node(canonical, alias)
+    for node in nodes.values():
+        metadata = node.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("owner") in aliases:
+            metadata["owner"] = aliases[metadata["owner"]]
+    for edge in edges.values():
+        edge["source"] = aliases.get(edge.get("source"), edge.get("source"))
+        edge["target"] = aliases.get(edge.get("target"), edge.get("target"))
+
+    structural = {
+        "assigned_to", "belongs_to", "blocked_by", "depends_on",
+        "parent_session", "spawned", "works_on",
+    }
+    seen: set[tuple[str, str, str]] = set()
+    for edge_id, edge in list(edges.items()):
+        if edge.get("kind") not in structural:
+            continue
+        signature = (str(edge.get("source")), str(edge.get("target")), str(edge.get("kind")))
+        if signature in seen:
+            edges.pop(edge_id, None)
+        else:
+            seen.add(signature)
 
 
 def upsert_node(
@@ -326,7 +471,7 @@ def cleanup_expired(now: float | None = None) -> dict[str, list[str]]:
         temporary_edges = list(conn.execute(
             """
             SELECT id, source_id, target_id, kind, created_at, metadata_json
-            FROM edges WHERE kind IN ('called', 'retrieved', 'returned')
+            FROM edges WHERE kind IN ('called', 'delegated', 'retrieved', 'returned')
             """
         ))
         endpoint_ids = {
@@ -471,7 +616,7 @@ def get_snapshot() -> dict[str, Any]:
         cursor_row = conn.execute(
             "SELECT COALESCE(MAX(sequence), 0) AS cursor FROM events"
         ).fetchone()
-        nodes = [
+        node_list = [
             {
                 "id": row["id"],
                 "kind": row["kind"],
@@ -484,7 +629,7 @@ def get_snapshot() -> dict[str, Any]:
             }
             for row in conn.execute("SELECT * FROM nodes ORDER BY created_at, id")
         ]
-        edges = [
+        edge_list = [
             {
                 "id": row["id"],
                 "source": row["source_id"],
@@ -497,15 +642,18 @@ def get_snapshot() -> dict[str, Any]:
                 "SELECT * FROM edges WHERE active = 1 ORDER BY created_at, id"
             )
         ]
+        nodes = {node["id"]: node for node in node_list}
+        edges = {edge["id"]: edge for edge in edge_list}
+        _canonicalize_scene(nodes, edges, _agent_node_aliases(conn))
         return {
             "schemaVersion": SCHEMA_VERSION,
             "cursor": int(cursor_row["cursor"]),
-            "nodes": nodes,
-            "edges": edges,
+            "nodes": list(nodes.values()),
+            "edges": list(edges.values()),
         }
 
 
-def get_snapshot_at(sequence: int) -> dict[str, Any]:
+def get_snapshot_at(sequence: int, activity_after: int | None = None) -> dict[str, Any]:
     """Rebuild a historical scene from normalized scene mutation events."""
     target = max(0, sequence)
     nodes: dict[str, dict[str, Any]] = {}
@@ -544,6 +692,46 @@ def get_snapshot_at(sequence: int) -> dict[str, Any]:
             else:
                 incoming = payload["edge"]
                 edges[incoming["id"]] = {**edges.get(incoming["id"], {}), **incoming}
+
+        # Compressed playback may advance thousands of event cursors between
+        # rendered frames. Carry every transient activity created in that gap
+        # into this frame so short-lived tool calls cannot disappear entirely.
+        if activity_after is not None:
+            lower = max(0, min(int(activity_after), resolved_cursor))
+            interval_nodes: dict[str, dict[str, Any]] = {}
+            interval_edges: dict[str, dict[str, Any]] = {}
+            for row in conn.execute(
+                """
+                SELECT event_type, payload_json FROM events
+                WHERE sequence > ? AND sequence <= ?
+                  AND event_type IN ('scene.node_upsert', 'scene.edge_upsert')
+                ORDER BY sequence
+                """,
+                (lower, resolved_cursor),
+            ):
+                payload = json.loads(row["payload_json"])
+                if row["event_type"] == "scene.node_upsert":
+                    node = payload["node"]
+                    interval_nodes[node["id"]] = node
+                else:
+                    edge = payload["edge"]
+                    if edge.get("kind") in {"called", "delegated", "retrieved", "returned"}:
+                        interval_edges[edge["id"]] = edge
+            for edge_id, edge in interval_edges.items():
+                if all(
+                    endpoint in nodes or endpoint in interval_nodes
+                    for endpoint in (edge.get("source"), edge.get("target"))
+                ):
+                    edges[edge_id] = edge
+            needed = {
+                endpoint
+                for edge in interval_edges.values()
+                for endpoint in (edge.get("source"), edge.get("target"))
+                if endpoint in interval_nodes and endpoint not in nodes
+            }
+            nodes.update({node_id: interval_nodes[node_id] for node_id in needed})
+
+        _canonicalize_scene(nodes, edges, _agent_node_aliases(conn))
 
     return {
         "schemaVersion": SCHEMA_VERSION,

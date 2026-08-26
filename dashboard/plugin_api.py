@@ -76,9 +76,12 @@ class GraphPreferences(BaseModel):
 
 
 @router.get("/snapshot")
-async def snapshot(at: int | None = Query(default=None, ge=0)):
+async def snapshot(
+    at: int | None = Query(default=None, ge=0),
+    activity_after: int | None = Query(default=None, alias="activityAfter", ge=0),
+):
     if at is not None:
-        result = await asyncio.to_thread(get_snapshot_at, at)
+        result = await asyncio.to_thread(get_snapshot_at, at, activity_after)
         result["asOf"] = await asyncio.to_thread(get_cursor_timestamp, result["cursor"])
         result["historical"] = True
         return result

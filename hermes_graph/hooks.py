@@ -10,8 +10,11 @@ from typing import Any, Callable
 
 from .storage import (
     cleanup_expired,
+    get_node_kind,
     get_setting,
     record_event,
+    register_agent_alias,
+    resolve_agent_key,
     resolve_vault_node_ids,
     upsert_edge as store_upsert_edge,
     upsert_node as store_upsert_node,
@@ -104,6 +107,14 @@ def _usage_pressure(payload: dict[str, Any]) -> float | None:
         return max(0.0, min(1.0, float(used) / float(maximum)))
     except (TypeError, ValueError):
         return None
+
+
+def _canonical_agent_key(payload: dict[str, Any]) -> str:
+    session = _session_id(payload)
+    raw = payload.get("task_id") or payload.get("turn_id") or session or "global"
+    if session and str(raw) != session:
+        register_agent_alias(str(raw), session)
+    return resolve_agent_key(raw)
 
 
 def _canonical_tool_name(tool_name: str) -> str:
@@ -312,6 +323,19 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
             status="active",
             metadata={"platform": payload.get("platform")},
         )
+        agent = _id("agent", session)
+        if get_node_kind(agent) != "subagent":
+            upsert_node(
+                agent,
+                "agent",
+                str(payload.get("model") or payload.get("profile_name") or "Hermes agent"),
+                status="active",
+                metadata={
+                    "profile": payload.get("profile_name"),
+                    "sessionId": session,
+                },
+            )
+        upsert_edge(f"belongs:{agent}:{session_node}", agent, session_node, "belongs_to")
     elif event_name in {"on_session_end", "on_session_finalize", "on_session_reset"} and session_node:
         if event_name == "on_session_finalize":
             status = "completed"
@@ -335,32 +359,67 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
         # child_session_id exists on both start and stop payloads; use it as
         # the stable identity so the completion event updates the same node.
         child_key = payload.get("child_session_id") or payload.get("child_subagent_id")
-        parent_key = payload.get("parent_subagent_id") or payload.get("parent_session_id")
+        if payload.get("child_subagent_id") and payload.get("child_session_id"):
+            register_agent_alias(
+                str(payload["child_subagent_id"]), str(payload["child_session_id"])
+            )
+        parent_key = resolve_agent_key(
+            payload.get("parent_subagent_id") or payload.get("parent_session_id")
+        )
         child = _id("agent", child_key)
         parent = _id("agent", parent_key)
+        if get_node_kind(parent) != "subagent":
+            upsert_node(
+                parent,
+                "agent",
+                str(parent_key or "Parent agent"),
+                status="active",
+                metadata={"sessionId": payload.get("parent_session_id")},
+            )
+        child_session = _id("session", child_key)
         upsert_node(
-            parent,
-            "agent",
-            str(parent_key or "Parent agent"),
+            child_session,
+            "session",
+            str(child_key or "Subagent session"),
             status="active",
+            metadata={"profile": payload.get("profile_name")},
         )
         upsert_node(
             child,
             "subagent",
             str(payload.get("child_role") or child_key or "Subagent"),
             status="active",
-            metadata={"goal": payload.get("child_goal")},
+            metadata={
+                "goal": payload.get("child_goal"),
+                "profile": payload.get("profile_name"),
+                "sessionId": child_key,
+            },
         )
         upsert_edge(f"spawned:{parent}:{child}", parent, child, "spawned")
+        upsert_edge(
+            f"belongs:{child}:{child_session}", child, child_session, "belongs_to"
+        )
+        created_at = time.time()
+        upsert_edge(
+            f"delegated:{parent}:{child}:{created_at}",
+            parent,
+            child,
+            "delegated",
+            metadata={"createdAt": created_at, "ttlSeconds": 30},
+        )
     elif event_name == "subagent_stop":
         child_key = (
             payload.get("child_subagent_id")
             or payload.get("subagent_id")
             or payload.get("child_session_id")
         )
+        child_key = resolve_agent_key(child_key)
         child = _id("agent", child_key)
         child_status = str(payload.get("child_status") or "completed")
-        metadata = {"durationMs": payload.get("duration_ms")}
+        metadata = {
+            "durationMs": payload.get("duration_ms"),
+            "sessionId": payload.get("child_session_id"),
+        }
         if child_status.lower() in {"completed", "done", "stopped"}:
             metadata["completedAt"] = time.time()
         upsert_node(
@@ -372,9 +431,10 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
         )
     elif event_name in {"pre_tool_call", "post_tool_call"}:
         tool_name = payload.get("tool_name") or payload.get("name") or "tool"
-        owner_key = payload.get("task_id") or payload.get("turn_id") or session or "global"
-        owner = _id("agent", owner_key) if owner_key != session else session_node
-        tool = _id("tool", f"{owner_key}:{tool_name}")
+        owner_key = _canonical_agent_key(payload)
+        owner = _id("agent", owner_key)
+        owner_is_subagent = get_node_kind(owner) == "subagent"
+        tool = _id("tool", f"{owner}:{tool_name}")
         rule = _tool_rule(str(tool_name))
         direction = rule["direction"] if rule else _heuristic_tool_direction(str(tool_name))
         upsert_node(
@@ -389,8 +449,9 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
             },
         )
         if owner:
-            owner_kind = "session" if owner == session_node else "agent"
-            upsert_node(owner, owner_kind, str(owner_key), status="active")
+            if not owner_is_subagent:
+                owner_kind = "session" if owner == session_node else "agent"
+                upsert_node(owner, owner_kind, str(owner_key), status="active")
             if session_node and owner != session_node:
                 upsert_edge(
                     f"belongs:{owner}:{session_node}",
@@ -398,9 +459,6 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
                     session_node,
                     "belongs_to",
                 )
-            if payload.get("task_id"):
-                task = _id("task", payload["task_id"])
-                upsert_edge(f"works-on:{owner}:{task}", owner, task, "works_on")
             called_at = time.time()
             upsert_edge(
                 f"called:{owner}:{tool}",
@@ -442,22 +500,23 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
                     metadata={"createdAt": created_at, "ttlSeconds": 30},
                 )
     elif event_name in {"pre_api_request", "post_api_request", "api_request_error"}:
-        agent_key = payload.get("task_id") or payload.get("turn_id") or session
+        agent_key = _canonical_agent_key(payload)
         agent = _id("agent", agent_key)
         pressure = _usage_pressure(payload)
         status = "failed" if event_name == "api_request_error" else "active"
-        upsert_node(
-            agent,
-            "agent",
-            str(payload.get("model") or "Hermes agent"),
-            status=status,
-            pressure=pressure,
-            metadata={
-                "model": payload.get("model"),
-                "provider": payload.get("provider"),
-                "sessionId": session,
-            },
-        )
+        if get_node_kind(agent) != "subagent":
+            upsert_node(
+                agent,
+                "agent",
+                str(payload.get("model") or "Hermes agent"),
+                status=status,
+                pressure=pressure,
+                metadata={
+                    "model": payload.get("model"),
+                    "provider": payload.get("provider"),
+                    "sessionId": session,
+                },
+            )
         if session_node:
             upsert_node(session_node, "session", str(session), status="active")
             upsert_edge(f"belongs:{agent}:{session_node}", agent, session_node, "belongs_to")

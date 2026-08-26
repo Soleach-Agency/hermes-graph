@@ -101,6 +101,71 @@ class HookTests(unittest.TestCase):
         self.assertEqual(children[0]["status"], "failed")
         self.assertEqual(children[0]["metadata"]["durationMs"], 1250)
 
+    def test_subagent_tool_calls_use_the_lifecycle_agent_identity(self):
+        context = FakeContext()
+        hooks.register_hooks(context)
+        context.callbacks["subagent_start"](
+            parent_session_id="session-1",
+            child_session_id="session-2",
+            child_subagent_id="sa-0-example",
+            child_role="Researcher",
+        )
+        context.callbacks["pre_tool_call"](
+            session_id="session-2",
+            task_id="sa-0-example",
+            tool_name="terminal",
+        )
+
+        snapshot = storage.get_snapshot()
+        children = [node for node in snapshot["nodes"] if node["kind"] == "subagent"]
+        tool = next(node for node in snapshot["nodes"] if node["kind"] == "tool")
+        called = next(edge for edge in snapshot["edges"] if edge["kind"] == "called")
+
+        self.assertEqual(len(children), 1)
+        self.assertEqual(tool["metadata"]["owner"], children[0]["id"])
+        self.assertEqual(called["source"], children[0]["id"])
+
+    def test_multiple_turn_ids_share_one_session_agent_and_tool_satellite(self):
+        context = FakeContext()
+        hooks.register_hooks(context)
+        context.callbacks["on_session_start"](
+            session_id="session-1", task_id="turn-a", platform="cli"
+        )
+        for task_id in ("turn-a", "turn-b"):
+            context.callbacks["pre_api_request"](
+                session_id="session-1", task_id=task_id, model="model-a"
+            )
+            context.callbacks["pre_tool_call"](
+                session_id="session-1", task_id=task_id, tool_name="terminal"
+            )
+
+        snapshot = storage.get_snapshot()
+        agents = [node for node in snapshot["nodes"] if node["kind"] == "agent"]
+        tools = [node for node in snapshot["nodes"] if node["kind"] == "tool"]
+        belongs = [edge for edge in snapshot["edges"] if edge["kind"] == "belongs_to"]
+
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["metadata"]["owner"], agents[0]["id"])
+        self.assertEqual(len(belongs), 1)
+
+    def test_subagent_has_structural_links_and_a_temporary_delegation_jump(self):
+        observer = hooks.make_observer("subagent_start")
+        observer(
+            parent_session_id="session-1",
+            child_session_id="session-2",
+            child_subagent_id="sa-0-example",
+            child_role="Researcher",
+        )
+
+        snapshot = storage.get_snapshot()
+        kinds = [edge["kind"] for edge in snapshot["edges"]]
+        self.assertIn("spawned", kinds)
+        self.assertIn("belongs_to", kinds)
+        self.assertIn("delegated", kinds)
+        delegated = next(edge for edge in snapshot["edges"] if edge["kind"] == "delegated")
+        self.assertEqual(delegated["metadata"]["ttlSeconds"], 30)
+
     def test_prompt_fields_are_not_recorded(self):
         cleaned = hooks._clean(
             {

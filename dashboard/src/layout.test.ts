@@ -63,4 +63,26 @@ describe("runtime layout boundary", () => {
     expect(next.get("task:2")).toBeDefined();
     expect(next.get("task:2")).not.toEqual(initial.get("task:1"));
   });
+
+  it("keeps a tool beside its metadata owner after the called edge expires", () => {
+    const nodes: SceneNode[] = [
+      { id: "session:1", kind: "session", label: "Session" },
+      { id: "agent:1", kind: "agent", label: "Agent" },
+      {
+        id: "tool:1",
+        kind: "tool",
+        label: "terminal",
+        metadata: { owner: "agent:1" },
+      },
+    ];
+    const positions = computeSpatialLayout(
+      nodes,
+      [{ id: "belongs", source: "agent:1", target: "session:1", kind: "belongs_to" }],
+      { vaultRadius: 155, runtimeOrbitRadius: 255 },
+    );
+    const agent = positions.get("agent:1")!;
+    const tool = positions.get("tool:1")!;
+    expect(Math.hypot(tool[0] - agent[0], tool[1] - agent[1], tool[2] - agent[2]))
+      .toBeCloseTo(22, 5);
+  });
 });

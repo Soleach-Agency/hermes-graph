@@ -211,6 +211,10 @@ export function computeSpatialLayout(
       positions.set(node.id, previous);
       continue;
     }
+    const metadataOwner =
+      node.kind === "tool" && typeof node.metadata?.owner === "string"
+        ? positions.get(node.metadata.owner)
+        : undefined;
     const relatedPositions = (neighbors.get(node.id) || [])
       .filter(({ node: related, edge }) => {
         if (related.kind === "note") return false;
@@ -222,7 +226,7 @@ export function computeSpatialLayout(
       })
       .map(({ node: related }) => positions.get(related.id))
       .filter((position): position is Position => Boolean(position));
-    const owner = average(relatedPositions);
+    const owner = metadataOwner || average(relatedPositions);
     const base = owner || scale(direction(hash(node.id)), options.runtimeOrbitRadius + 70);
     const distance = node.kind === "result" ? 11 : node.kind === "tool" ? 22 : 28;
     positions.set(node.id, offset(base, hash(node.id) + 307, distance));

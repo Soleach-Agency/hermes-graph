@@ -80,6 +80,39 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(storage.get_snapshot_at(first)["nodes"][0]["pressure"], 0.2)
         self.assertEqual(storage.get_snapshot_at(second)["nodes"][0]["pressure"], 0.9)
 
+    def test_playback_carries_transient_activity_across_sampled_cursor_gap(self):
+        for node_id, kind in (
+            ("agent:1", "agent"),
+            ("tool:1", "tool"),
+            ("note:1", "note"),
+        ):
+            storage.record_event(
+                "scene.node_upsert",
+                {"node": {
+                    "id": node_id, "kind": kind, "label": node_id,
+                    "status": "observed", "color": None, "size": None,
+                    "pressure": None, "metadata": {},
+                }},
+                source="projection",
+            )
+        activity_after = storage.record_event("unrelated", {})
+        storage.record_event(
+            "scene.edge_upsert",
+            {"edge": {
+                "id": "retrieved:1", "source": "tool:1", "target": "note:1",
+                "kind": "retrieved", "active": True,
+                "metadata": {"createdAt": 10.0, "ttlSeconds": 30},
+            }},
+            source="projection",
+        )
+        end = storage.record_event(
+            "scene.edge_delete", {"id": "retrieved:1"}, source="projection"
+        )
+
+        self.assertEqual(storage.get_snapshot_at(end)["edges"], [])
+        replay = storage.get_snapshot_at(end, activity_after)
+        self.assertEqual([edge["id"] for edge in replay["edges"]], ["retrieved:1"])
+
     def test_timeline_range_resolves_recent_window_and_maximum(self):
         first = storage.record_event("event.old", {}, occurred_at=1_000)
         storage.record_event("event.middle", {}, occurred_at=10_000)
@@ -182,6 +215,7 @@ class StorageTests(unittest.TestCase):
             storage.upsert_node(node_id, kind, node_id, metadata=metadata)
         for kind, source, target in (
             ("called", "agent:1", "tool:1"),
+            ("delegated", "agent:1", "tool:1"),
             ("retrieved", "tool:1", "note:1"),
             ("returned", "tool:1", "result:1"),
         ):
@@ -192,7 +226,7 @@ class StorageTests(unittest.TestCase):
 
         removed = storage.cleanup_expired(now=11.0)
         self.assertEqual(
-            removed["edges"], ["called:1", "retrieved:1", "returned:1"]
+            removed["edges"], ["called:1", "delegated:1", "retrieved:1", "returned:1"]
         )
         self.assertEqual(removed["nodes"], ["result:1"])
 
