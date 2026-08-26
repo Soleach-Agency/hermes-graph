@@ -85,4 +85,68 @@ describe("runtime layout boundary", () => {
     expect(Math.hypot(tool[0] - agent[0], tool[1] - agent[1], tool[2] - agent[2]))
       .toBeCloseTo(22, 5);
   });
+
+  it("keeps external results beside their source tool regardless of snapshot order", () => {
+    const nodes: SceneNode[] = [
+      {
+        id: "result:1",
+        kind: "result",
+        label: "File search result",
+        metadata: { tool: "tool:1" },
+      },
+      { id: "session:1", kind: "session", label: "Session" },
+      { id: "agent:1", kind: "agent", label: "Agent" },
+      {
+        id: "tool:1",
+        kind: "tool",
+        label: "file_search",
+        metadata: { owner: "agent:1", direction: "external" },
+      },
+    ];
+    const positions = computeSpatialLayout(
+      nodes,
+      [{ id: "belongs", source: "agent:1", target: "session:1", kind: "belongs_to" }],
+      { vaultRadius: 155, runtimeOrbitRadius: 255 },
+    );
+    const tool = positions.get("tool:1")!;
+    const result = positions.get("result:1")!;
+
+    expect(Math.hypot(result[0] - tool[0], result[1] - tool[1], result[2] - tool[2]))
+      .toBeCloseTo(11, 5);
+  });
+
+  it("pulls a result back to its tool when an earlier fallback placed it far away", () => {
+    const nodes: SceneNode[] = [
+      { id: "session:1", kind: "session", label: "Session" },
+      { id: "agent:1", kind: "agent", label: "Agent" },
+      {
+        id: "tool:1",
+        kind: "tool",
+        label: "file_search",
+        metadata: { owner: "agent:1", direction: "external" },
+      },
+      {
+        id: "result:1",
+        kind: "result",
+        label: "File search result",
+        metadata: { tool: "tool:1" },
+      },
+    ];
+    const first = computeSpatialLayout(nodes, [], {
+      vaultRadius: 155,
+      runtimeOrbitRadius: 255,
+    });
+    const previousPositions = new Map(first);
+    previousPositions.set("result:1", [-320, 40, 15]);
+    const next = computeSpatialLayout(nodes, [], {
+      vaultRadius: 155,
+      runtimeOrbitRadius: 255,
+      previousPositions,
+    });
+    const tool = next.get("tool:1")!;
+    const result = next.get("result:1")!;
+
+    expect(Math.hypot(result[0] - tool[0], result[1] - tool[1], result[2] - tool[2]))
+      .toBeCloseTo(11, 5);
+  });
 });

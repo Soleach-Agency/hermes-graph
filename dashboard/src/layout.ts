@@ -198,23 +198,32 @@ export function computeSpatialLayout(
     }
   }
 
-  const satellites = nodes.filter((node) =>
-    ["tool", "artifact", "skill", "result", "search", "external"].includes(node.kind),
-  );
+  const satellites = nodes
+    .filter((node) =>
+      ["tool", "artifact", "skill", "result", "search", "external"].includes(node.kind),
+    )
+    // Snapshot order is not a layout contract. Resolve tools before the
+    // transient result nodes that use them as spatial anchors.
+    .sort((left, right) => {
+      const priority = (node: SceneNode) =>
+        node.kind === "tool" ? 0 : node.kind === "result" ? 2 : 1;
+      return priority(left) - priority(right);
+    });
   for (const node of satellites) {
     if (node.position) {
       positions.set(node.id, node.position);
       continue;
     }
     const previous = previousPositions?.get(node.id);
-    if (previous) {
-      positions.set(node.id, previous);
-      continue;
-    }
-    const metadataOwner =
+    const metadataOwnerId =
       node.kind === "tool" && typeof node.metadata?.owner === "string"
-        ? positions.get(node.metadata.owner)
-        : undefined;
+        ? node.metadata.owner
+        : typeof node.metadata?.tool === "string"
+          ? node.metadata.tool
+          : undefined;
+    const metadataOwner = metadataOwnerId
+      ? positions.get(metadataOwnerId)
+      : undefined;
     const relatedPositions = (neighbors.get(node.id) || [])
       .filter(({ node: related, edge }) => {
         if (related.kind === "note") return false;
@@ -227,9 +236,22 @@ export function computeSpatialLayout(
       .map(({ node: related }) => positions.get(related.id))
       .filter((position): position is Position => Boolean(position));
     const owner = metadataOwner || average(relatedPositions);
+    if (previous && (!owner || node.kind !== "result")) {
+      positions.set(node.id, previous);
+      continue;
+    }
     const base = owner || scale(direction(hash(node.id)), options.runtimeOrbitRadius + 70);
     const distance = node.kind === "result" ? 11 : node.kind === "tool" ? 22 : 28;
-    positions.set(node.id, offset(base, hash(node.id) + 307, distance));
+    const candidate = offset(base, hash(node.id) + 307, distance);
+    // Results belong to the request that produced them. Recompute this small
+    // cluster from the tool so a stale fallback position cannot strand a
+    // temporary node on the other side of the graph.
+    positions.set(
+      node.id,
+      node.kind === "result"
+        ? clampRadius(candidate, options.vaultRadius + 42, hash(node.id) + 911)
+        : candidate,
+    );
   }
 
   nodes.forEach((node, index) => {
