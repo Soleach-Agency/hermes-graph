@@ -5,10 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .storage import hermes_home, machine_hermes_home, replace_runtime_hydration_projection
+from .storage import (
+    hermes_home,
+    lifecycle_fade_seconds,
+    machine_hermes_home,
+    replace_runtime_hydration_projection,
+)
 
 
 _RUNTIME_PROVENANCE = "runtime_sessions"
@@ -91,6 +98,19 @@ def _status(row: dict[str, Any]) -> str:
     return "active" if row.get("ended_at") is None else "completed"
 
 
+def _timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        return timestamp if timestamp >= 946_684_800 else None
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return timestamp if timestamp >= 946_684_800 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_delegate(row: dict[str, Any]) -> bool:
     raw = row.get("model_config")
     if not isinstance(raw, str) or not raw:
@@ -119,6 +139,8 @@ def hydrate_runtime(
     edges: dict[str, dict[str, Any]] = {}
     hydrated_sessions = 0
     supported_stores = 0
+    now = time.time()
+    fade_seconds = lifecycle_fade_seconds()
 
     records: list[tuple[str, dict[str, Any]]] = []
     for store_profile, path in sorted(stores.items()):
@@ -130,6 +152,10 @@ def hydrate_runtime(
             (str(row.get("profile_name") or store_profile), row)
             for row in rows
             if row.get("id")
+            and (
+                _timestamp(row.get("ended_at")) is None
+                or now - _timestamp(row.get("ended_at")) < fade_seconds
+            )
         )
 
     profiles_by_session: dict[str, str | None] = {}
@@ -156,6 +182,10 @@ def hydrate_runtime(
             "contextAvailable": False,
             "provenance": _RUNTIME_PROVENANCE,
         }
+        completed_at = _timestamp(row.get("ended_at"))
+        if completed_at is not None:
+            session_metadata["completedAt"] = completed_at
+            agent_metadata["completedAt"] = completed_at
         for stored, projected in (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens")):
             if isinstance(row.get(stored), (int, float)):
                 agent_metadata[projected] = row[stored]

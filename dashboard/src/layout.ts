@@ -51,6 +51,36 @@ function clampRadius(position: Position, minimum: number, seed: number): Positio
 interface LayoutOptions {
   vaultRadius: number;
   runtimeOrbitRadius: number;
+  previousPositions?: Map<string, Position>;
+}
+
+function mostOpenPosition(
+  id: string,
+  radius: number,
+  occupied: Position[],
+): Position {
+  const seed = hash(id);
+  let best = scale(direction(seed), radius);
+  let bestClearance = -1;
+  for (let candidateIndex = 0; candidateIndex < 32; candidateIndex += 1) {
+    const candidateRadius = radius + (randomFrom(seed + candidateIndex * 97) - 0.5) * 28;
+    const candidate = scale(direction(seed + candidateIndex * 7919), candidateRadius);
+    const clearance = occupied.length
+      ? Math.min(
+          ...occupied.map((position) => {
+            const x = position[0] - candidate[0];
+            const y = position[1] - candidate[1];
+            const z = position[2] - candidate[2];
+            return x * x + y * y + z * z;
+          }),
+        )
+      : Number.POSITIVE_INFINITY;
+    if (clearance > bestClearance) {
+      best = candidate;
+      bestClearance = clearance;
+    }
+  }
+  return best;
 }
 
 export function computeSpatialLayout(
@@ -59,6 +89,7 @@ export function computeSpatialLayout(
   options: LayoutOptions,
 ): Map<string, Position> {
   const positions = new Map<string, Position>();
+  const previousPositions = options.previousPositions;
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const neighbors = new Map<string, Array<{ node: SceneNode; edge: SceneEdge }>>();
 
@@ -94,9 +125,19 @@ export function computeSpatialLayout(
   }
 
   const anchors = nodes.filter((node) => node.kind === "session" || node.kind === "task");
-  anchors.forEach((node, index) => {
+  const occupiedRuntime: Position[] = nodes
+    .filter((node) => node.kind !== "note")
+    .map((node) => previousPositions?.get(node.id))
+    .filter((position): position is Position => Boolean(position));
+  anchors.forEach((node) => {
     if (node.position) {
       positions.set(node.id, node.position);
+      occupiedRuntime.push(node.position);
+      return;
+    }
+    const previous = previousPositions?.get(node.id);
+    if (previous) {
+      positions.set(node.id, previous);
       return;
     }
     const seed = hash(node.id);
@@ -104,15 +145,9 @@ export function computeSpatialLayout(
       options.runtimeOrbitRadius +
       (node.kind === "task" ? 22 : 0) +
       (randomFrom(seed + 73) - 0.5) * 34;
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    const y = 1 - ((index + 0.5) / Math.max(1, anchors.length)) * 2;
-    const radial = Math.sqrt(Math.max(0, 1 - y * y));
-    const angle = index * goldenAngle + randomFrom(seed) * 0.25;
-    positions.set(node.id, [
-      Math.cos(angle) * radial * radius,
-      y * radius,
-      Math.sin(angle) * radial * radius,
-    ]);
+    const position = mostOpenPosition(node.id, radius, occupiedRuntime);
+    positions.set(node.id, position);
+    occupiedRuntime.push(position);
   });
 
   const agents = nodes.filter((node) => node.kind === "agent");
@@ -121,16 +156,24 @@ export function computeSpatialLayout(
       positions.set(node.id, node.position);
       return;
     }
+    const previous = previousPositions?.get(node.id);
+    if (previous) {
+      positions.set(node.id, previous);
+      return;
+    }
     const relatedAnchors = (neighbors.get(node.id) || [])
       .filter(({ node: related }) => related.kind === "session" || related.kind === "task")
       .map(({ node: related }) => positions.get(related.id))
       .filter((position): position is Position => Boolean(position));
     const owner = average(relatedAnchors);
-    const fallback = scale(
-      direction(hash(node.id)),
+    const fallback = mostOpenPosition(
+      node.id,
       options.runtimeOrbitRadius + 38 + (index % 5) * 4,
+      occupiedRuntime,
     );
-    positions.set(node.id, offset(owner || fallback, hash(node.id) + 101, owner ? 34 : 0));
+    const position = offset(owner || fallback, hash(node.id) + 101, owner ? 34 : 0);
+    positions.set(node.id, position);
+    occupiedRuntime.push(position);
   });
 
   const subagents = nodes.filter(
@@ -140,6 +183,11 @@ export function computeSpatialLayout(
         (neighbors.get(node.id) || []).some(({ edge }) => edge.kind === "spawned")),
   );
   for (const node of subagents) {
+    const previous = previousPositions?.get(node.id);
+    if (previous) {
+      positions.set(node.id, previous);
+      continue;
+    }
     const parentRelation = (neighbors.get(node.id) || []).find(
       ({ edge, node: related }) =>
         edge.kind === "spawned" && edge.target === node.id && related.id !== node.id,
@@ -150,14 +198,32 @@ export function computeSpatialLayout(
     }
   }
 
-  const satellites = nodes.filter((node) =>
-    ["tool", "artifact", "skill", "result", "search", "external"].includes(node.kind),
-  );
+  const satellites = nodes
+    .filter((node) =>
+      ["tool", "artifact", "skill", "result", "search", "external"].includes(node.kind),
+    )
+    // Snapshot order is not a layout contract. Resolve tools before the
+    // transient result nodes that use them as spatial anchors.
+    .sort((left, right) => {
+      const priority = (node: SceneNode) =>
+        node.kind === "tool" ? 0 : node.kind === "result" ? 2 : 1;
+      return priority(left) - priority(right);
+    });
   for (const node of satellites) {
     if (node.position) {
       positions.set(node.id, node.position);
       continue;
     }
+    const previous = previousPositions?.get(node.id);
+    const metadataOwnerId =
+      node.kind === "tool" && typeof node.metadata?.owner === "string"
+        ? node.metadata.owner
+        : typeof node.metadata?.tool === "string"
+          ? node.metadata.tool
+          : undefined;
+    const metadataOwner = metadataOwnerId
+      ? positions.get(metadataOwnerId)
+      : undefined;
     const relatedPositions = (neighbors.get(node.id) || [])
       .filter(({ node: related, edge }) => {
         if (related.kind === "note") return false;
@@ -169,10 +235,23 @@ export function computeSpatialLayout(
       })
       .map(({ node: related }) => positions.get(related.id))
       .filter((position): position is Position => Boolean(position));
-    const owner = average(relatedPositions);
+    const owner = metadataOwner || average(relatedPositions);
+    if (previous && (!owner || node.kind !== "result")) {
+      positions.set(node.id, previous);
+      continue;
+    }
     const base = owner || scale(direction(hash(node.id)), options.runtimeOrbitRadius + 70);
     const distance = node.kind === "result" ? 11 : node.kind === "tool" ? 22 : 28;
-    positions.set(node.id, offset(base, hash(node.id) + 307, distance));
+    const candidate = offset(base, hash(node.id) + 307, distance);
+    // Results belong to the request that produced them. Recompute this small
+    // cluster from the tool so a stale fallback position cannot strand a
+    // temporary node on the other side of the graph.
+    positions.set(
+      node.id,
+      node.kind === "result"
+        ? clampRadius(candidate, options.vaultRadius + 42, hash(node.id) + 911)
+        : candidate,
+    );
   }
 
   nodes.forEach((node, index) => {

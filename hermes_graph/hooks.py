@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from typing import Any, Callable
 
 from .storage import (
     cleanup_expired,
+    get_node_kind,
+    get_setting,
     record_event,
+    register_agent_alias,
+    resolve_agent_key,
     resolve_vault_node_ids,
     upsert_edge as store_upsert_edge,
     upsert_node as store_upsert_node,
@@ -104,7 +109,46 @@ def _usage_pressure(payload: dict[str, Any]) -> float | None:
         return None
 
 
+def _canonical_agent_key(payload: dict[str, Any]) -> str:
+    session = _session_id(payload)
+    raw = payload.get("task_id") or payload.get("turn_id") or session or "global"
+    if session and str(raw) != session:
+        register_agent_alias(str(raw), session)
+    return resolve_agent_key(raw)
+
+
+def _canonical_tool_name(tool_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", tool_name.casefold()).strip("_")
+
+
+def _tool_rule(tool_name: str) -> dict[str, str] | None:
+    preferences = get_setting("graph_preferences", {})
+    rules = preferences.get("toolRules", []) if isinstance(preferences, dict) else []
+    canonical = _canonical_tool_name(tool_name)
+    for candidate in rules if isinstance(rules, list) else []:
+        if not isinstance(candidate, dict):
+            continue
+        if _canonical_tool_name(str(candidate.get("tool") or "")) != canonical:
+            continue
+        direction = str(candidate.get("direction") or "local").lower()
+        if direction not in {"vault", "external", "local"}:
+            direction = "local"
+        return {
+            "tool": str(candidate.get("tool") or tool_name),
+            "direction": direction,
+            "referenceField": str(candidate.get("referenceField") or "").strip(),
+        }
+    return None
+
+
 def _tool_direction(tool_name: str) -> str:
+    rule = _tool_rule(tool_name)
+    if rule:
+        return rule["direction"]
+    return _heuristic_tool_direction(tool_name)
+
+
+def _heuristic_tool_direction(tool_name: str) -> str:
     normalized = tool_name.lower()
     vault_terms = ("rag", "semantic", "fuzzy", "vault", "memory", "note", "obsidian")
     external_terms = (
@@ -140,32 +184,65 @@ def _result_count(value: Any) -> int:
     return 1 if value is not None else 0
 
 
-def _result_references(value: Any, depth: int = 0) -> list[str]:
+def _result_references(
+    value: Any, depth: int = 0, reference_field: str | None = None
+) -> list[str]:
     """Extract only short note identifiers from tool output, never result content."""
     if depth > 4:
         return []
     if isinstance(value, str):
-        if depth == 0 and len(value) <= 1_000_000:
-            try:
-                return _result_references(json.loads(value), depth + 1)
-            except (TypeError, ValueError):
-                return []
+        if len(value) <= 1_000_000:
+            if depth == 0:
+                try:
+                    return _result_references(json.loads(value), depth + 1, reference_field)
+                except (TypeError, ValueError):
+                    pass
+            field = (reference_field or "").casefold().strip()
+            if field:
+                localized_labels = {
+                    "path": {"path", "yol"},
+                    "file": {"file", "dosya"},
+                    "filepath": {"filepath", "file path", "dosya yolu"},
+                    "source": {"source", "kaynak"},
+                    "title": {"title", "başlık", "baslik"},
+                }
+                labels = localized_labels.get(field, {field})
+                found: list[str] = []
+                for line in value.splitlines():
+                    cleaned = line.strip().removeprefix(">").strip()
+                    label, separator, candidate = cleaned.partition(":")
+                    if separator and label.casefold().strip() in labels:
+                        candidate = candidate.strip().strip("`")
+                        if candidate and len(candidate) <= 500:
+                            found.append(candidate)
+                    if len(found) >= 20:
+                        break
+                if found or len(value) > 500:
+                    return found
+        if reference_field:
+            return []
         return [value] if len(value) <= 500 else []
     if isinstance(value, (list, tuple)):
         found: list[str] = []
         for item in value[:20]:
-            found.extend(_result_references(item, depth + 1))
+            found.extend(_result_references(item, depth + 1, reference_field))
             if len(found) >= 20:
                 break
         return found[:20]
     if isinstance(value, dict):
         found = []
-        reference_keys = {"file", "filepath", "note", "path", "source", "title"}
+        reference_keys = (
+            {reference_field.casefold()}
+            if reference_field
+            else {"file", "filepath", "note", "path", "source", "title"}
+        )
         for key, item in value.items():
             if str(key).lower() in reference_keys and isinstance(item, str) and len(item) <= 500:
                 found.append(item)
-            elif isinstance(item, (dict, list, tuple)):
-                found.extend(_result_references(item, depth + 1))
+            elif isinstance(item, (dict, list, tuple)) or (
+                reference_field and isinstance(item, str)
+            ):
+                found.extend(_result_references(item, depth + 1, reference_field))
             if len(found) >= 20:
                 break
         return found[:20]
@@ -246,6 +323,19 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
             status="active",
             metadata={"platform": payload.get("platform")},
         )
+        agent = _id("agent", session)
+        if get_node_kind(agent) != "subagent":
+            upsert_node(
+                agent,
+                "agent",
+                str(payload.get("model") or payload.get("profile_name") or "Hermes agent"),
+                status="active",
+                metadata={
+                    "profile": payload.get("profile_name"),
+                    "sessionId": session,
+                },
+            )
+        upsert_edge(f"belongs:{agent}:{session_node}", agent, session_node, "belongs_to")
     elif event_name in {"on_session_end", "on_session_finalize", "on_session_reset"} and session_node:
         if event_name == "on_session_finalize":
             status = "completed"
@@ -255,65 +345,120 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
             # on_session_end fires after each run_conversation call, not only
             # when the session itself is permanently closed.
             status = "interrupted" if payload.get("interrupted") else "idle"
+        metadata = {"platform": payload.get("platform")}
+        if status in {"completed", "reset"}:
+            metadata["completedAt"] = time.time()
         upsert_node(
             session_node,
             "session",
             str(payload.get("title") or session or "Session"),
             status=status,
-            metadata={"platform": payload.get("platform")},
+            metadata=metadata,
         )
     elif event_name == "subagent_start":
         # child_session_id exists on both start and stop payloads; use it as
         # the stable identity so the completion event updates the same node.
         child_key = payload.get("child_session_id") or payload.get("child_subagent_id")
-        parent_key = payload.get("parent_subagent_id") or payload.get("parent_session_id")
+        if payload.get("child_subagent_id") and payload.get("child_session_id"):
+            register_agent_alias(
+                str(payload["child_subagent_id"]), str(payload["child_session_id"])
+            )
+        parent_key = resolve_agent_key(
+            payload.get("parent_subagent_id") or payload.get("parent_session_id")
+        )
         child = _id("agent", child_key)
         parent = _id("agent", parent_key)
+        if get_node_kind(parent) != "subagent":
+            upsert_node(
+                parent,
+                "agent",
+                str(parent_key or "Parent agent"),
+                status="active",
+                metadata={"sessionId": payload.get("parent_session_id")},
+            )
+        child_session = _id("session", child_key)
         upsert_node(
-            parent,
-            "agent",
-            str(parent_key or "Parent agent"),
+            child_session,
+            "session",
+            str(child_key or "Subagent session"),
             status="active",
+            metadata={"profile": payload.get("profile_name")},
         )
         upsert_node(
             child,
             "subagent",
             str(payload.get("child_role") or child_key or "Subagent"),
             status="active",
-            metadata={"goal": payload.get("child_goal")},
+            metadata={
+                "goal": payload.get("child_goal"),
+                "profile": payload.get("profile_name"),
+                "sessionId": child_key,
+            },
         )
         upsert_edge(f"spawned:{parent}:{child}", parent, child, "spawned")
+        upsert_edge(
+            f"belongs:{child}:{child_session}", child, child_session, "belongs_to"
+        )
+        created_at = time.time()
+        upsert_edge(
+            f"delegated:{parent}:{child}:{created_at}",
+            parent,
+            child,
+            "delegated",
+            metadata={"createdAt": created_at, "ttlSeconds": 30},
+        )
     elif event_name == "subagent_stop":
         child_key = (
             payload.get("child_subagent_id")
             or payload.get("subagent_id")
             or payload.get("child_session_id")
         )
+        child_key = resolve_agent_key(child_key)
         child = _id("agent", child_key)
         child_status = str(payload.get("child_status") or "completed")
+        metadata = {
+            "durationMs": payload.get("duration_ms"),
+            "sessionId": payload.get("child_session_id"),
+        }
+        if child_status.lower() in {"completed", "done", "stopped"}:
+            metadata["completedAt"] = time.time()
         upsert_node(
             child,
             "subagent",
             str(payload.get("child_role") or child_key or "Subagent"),
             status=child_status,
-            metadata={"durationMs": payload.get("duration_ms")},
+            metadata=metadata,
         )
     elif event_name in {"pre_tool_call", "post_tool_call"}:
         tool_name = payload.get("tool_name") or payload.get("name") or "tool"
-        owner_key = payload.get("task_id") or payload.get("turn_id") or session or "global"
-        owner = _id("agent", owner_key) if owner_key != session else session_node
-        tool = _id("tool", f"{owner_key}:{tool_name}")
-        direction = _tool_direction(str(tool_name))
+        owner_key = _canonical_agent_key(payload)
+        owner = _id("agent", owner_key)
+        owner_is_subagent = get_node_kind(owner) == "subagent"
+        tool = _id("tool", f"{owner}:{tool_name}")
+        rule = _tool_rule(str(tool_name))
+        direction = rule["direction"] if rule else _heuristic_tool_direction(str(tool_name))
         upsert_node(
             tool,
             "tool",
             str(tool_name),
             status="active" if event_name == "pre_tool_call" else "observed",
-            metadata={"direction": direction, "owner": owner},
+            metadata={
+                "direction": direction,
+                "owner": owner,
+                "referenceField": rule["referenceField"] if rule else "",
+            },
         )
         if owner:
-            owner_kind = "session" if owner == session_node else "agent"
-            upsert_node(owner, owner_kind, str(owner_key), status="active")
+            if not owner_is_subagent:
+                owner_kind = "session" if owner == session_node else "agent"
+                upsert_node(owner, owner_kind, str(owner_key), status="active")
+            if session_node and owner != session_node:
+                upsert_edge(
+                    f"belongs:{owner}:{session_node}",
+                    owner,
+                    session_node,
+                    "belongs_to",
+                )
             called_at = time.time()
             upsert_edge(
                 f"called:{owner}:{tool}",
@@ -355,22 +500,23 @@ def project(event_name: str, payload: dict[str, Any]) -> None:
                     metadata={"createdAt": created_at, "ttlSeconds": 30},
                 )
     elif event_name in {"pre_api_request", "post_api_request", "api_request_error"}:
-        agent_key = payload.get("task_id") or payload.get("turn_id") or session
+        agent_key = _canonical_agent_key(payload)
         agent = _id("agent", agent_key)
         pressure = _usage_pressure(payload)
         status = "failed" if event_name == "api_request_error" else "active"
-        upsert_node(
-            agent,
-            "agent",
-            str(payload.get("model") or "Hermes agent"),
-            status=status,
-            pressure=pressure,
-            metadata={
-                "model": payload.get("model"),
-                "provider": payload.get("provider"),
-                "sessionId": session,
-            },
-        )
+        if get_node_kind(agent) != "subagent":
+            upsert_node(
+                agent,
+                "agent",
+                str(payload.get("model") or "Hermes agent"),
+                status=status,
+                pressure=pressure,
+                metadata={
+                    "model": payload.get("model"),
+                    "provider": payload.get("provider"),
+                    "sessionId": session,
+                },
+            )
         if session_node:
             upsert_node(session_node, "session", str(session), status="active")
             upsert_edge(f"belongs:{agent}:{session_node}", agent, session_node, "belongs_to")
@@ -414,9 +560,13 @@ def make_observer(event_name: str, profile_name: str | None = None) -> Callable[
             raw_result = kwargs.get("result", kwargs.get("tool_result"))
             payload["result_count"] = _result_count(raw_result)
             tool_name = str(kwargs.get("tool_name") or kwargs.get("name") or "tool")
-            if _tool_direction(tool_name) == "vault":
+            rule = _tool_rule(tool_name)
+            if (rule["direction"] if rule else _heuristic_tool_direction(tool_name)) == "vault":
                 payload["result_node_ids"] = resolve_vault_node_ids(
-                    _result_references(raw_result)
+                    _result_references(
+                        raw_result,
+                        reference_field=rule["referenceField"] if rule else None,
+                    )
                 )
         session = _session_id(payload)
         record_event(event_name, payload, session_id=session)

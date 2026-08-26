@@ -5,15 +5,29 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .storage import machine_hermes_home, replace_runtime_hydration_projection
+from .storage import (
+    lifecycle_fade_seconds,
+    machine_hermes_home,
+    replace_runtime_hydration_projection,
+)
 
 
 _KANBAN_PROVENANCE = "kanban"
 _REQUIRED_TASK_COLUMNS = {"id", "title", "status"}
-_TASK_COLUMNS = ("id", "title", "assignee", "status", "block_kind")
+_TASK_COLUMNS = (
+    "id",
+    "title",
+    "assignee",
+    "status",
+    "block_kind",
+    "completed_at",
+    "updated_at",
+)
 
 
 def _id(prefix: str, value: str) -> str:
@@ -65,6 +79,19 @@ def _status(value: Any) -> str:
     return {"running": "doing", "done": "done", "archived": "archived"}.get(status, status)
 
 
+def _timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        return timestamp if timestamp >= 946_684_800 else None
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return timestamp if timestamp >= 946_684_800 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def hydrate_kanban(store: Path | None = None) -> dict[str, int]:
     """Hydrate concise live Kanban topology without reading bodies or comments.
 
@@ -83,20 +110,30 @@ def hydrate_kanban(store: Path | None = None) -> dict[str, int]:
     rows, links = loaded
     nodes: dict[str, dict[str, Any]] = {}
     task_statuses: dict[str, str] = {}
+    now = time.time()
+    fade_seconds = lifecycle_fade_seconds()
     for row in rows:
         task_id = str(row["id"])
-        task_statuses[task_id] = _status(row.get("status"))
+        status = _status(row.get("status"))
+        completed_at = _timestamp(row.get("completed_at"))
+        if status == "done" and completed_at is not None and now - completed_at >= fade_seconds:
+            continue
+        task_statuses[task_id] = status
         metadata: dict[str, Any] = {"provenance": _KANBAN_PROVENANCE}
         if row.get("assignee"):
             metadata["assignee"] = str(row["assignee"])
         if row.get("block_kind"):
             metadata["blockKind"] = str(row["block_kind"])
+        if completed_at is not None:
+            metadata["completedAt"] = completed_at
         node_id = _id("task", task_id)
         nodes[node_id] = {"id": node_id, "kind": "task", "label": str(row["title"]), "status": task_statuses[task_id], "color": None, "size": None, "pressure": None, "metadata": metadata}
     edges: dict[str, dict[str, Any]] = {}
     for parent_id, child_id in links:
         parent = _id("task", parent_id)
         child = _id("task", child_id)
+        if parent not in nodes or child not in nodes:
+            continue
         dependency_id = f"depends:{child}:{parent}"
         edges[dependency_id] = {"id": dependency_id, "source": child, "target": parent, "kind": "depends_on", "active": True, "metadata": {"provenance": _KANBAN_PROVENANCE}}
         if task_statuses.get(child_id) == "blocked" and task_statuses.get(parent_id) != "done":

@@ -7,27 +7,28 @@ import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 
 import { computeSpatialLayout, type Position } from "./layout";
+import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
+import { isActivityEdge, isPersistentEdge } from "./edgePolicy";
 import {
+  mergeTimelapseAnimation,
+  resolveRouteAnimationFrame,
+} from "./routeAnimation";
+import {
+  DEFAULT_TIMELAPSE,
   DEFAULT_THEME,
   type GraphTheme,
   type SceneEdge,
   type SceneNode,
   type SceneSnapshot,
+  type TimelapseAnimationPreferences,
 } from "./types";
 
-const JUMP_EDGE_KINDS = new Set(["called", "retrieved", "returned"]);
-
 const vertexShader = `
-  attribute float aSize;
-  attribute float aSizeFrom;
+  attribute vec4 aSizeState;
   attribute vec3 aNodeColor;
   attribute vec3 aNodeColorFrom;
-  attribute float aIntensity;
-  attribute float aIntensityFrom;
-  attribute float aDoneAge;
-  attribute float aBornAge;
-  attribute float aJumpStart;
-  attribute float aJumpEnd;
+  attribute vec4 aLifecycleState;
+  attribute vec2 aJumpWindow;
   attribute vec3 aPositionFrom;
   varying vec3 vColor;
   varying float vIntensity;
@@ -36,7 +37,7 @@ const vertexShader = `
   varying float vJumpPulse;
   uniform float uPixelRatio;
   uniform float uTime;
-  uniform float uKanbanFadeSeconds;
+  uniform float uLifecycleRate;
   uniform float uJumpTargetScale;
   uniform float uTransitionStart;
   uniform float uTransitionDuration;
@@ -48,23 +49,28 @@ const vertexShader = `
       clamp((uTime - uTransitionStart) / max(0.001, uTransitionDuration), 0.0, 1.0)
     );
     vec3 animatedPosition = mix(aPositionFrom, position, transition);
-    float animatedSize = mix(aSizeFrom, aSize, transition);
+    float animatedSize = mix(aSizeState.y, aSizeState.x, transition);
     vColor = mix(aNodeColorFrom, aNodeColor, transition);
-    vIntensity = mix(aIntensityFrom, aIntensity, transition);
-    vLifecycle = aDoneAge < 0.0 ? 0.0 : clamp((aDoneAge + uTime) / uKanbanFadeSeconds, 0.0, 1.0);
-    vBirth = aBornAge < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aBornAge + uTime);
-    float safeJumpStart = max(0.0, aJumpStart);
-    float safeJumpEnd = max(safeJumpStart + 0.08, aJumpEnd);
+    vIntensity = mix(aSizeState.w, aSizeState.z, transition);
+    float liveLifecycleElapsed = max(0.0, uTime - uTransitionStart) * uLifecycleRate;
+    vLifecycle = aLifecycleState.z * clamp(
+      (aLifecycleState.x + liveLifecycleElapsed) / max(1.0, aLifecycleState.y),
+      0.0,
+      1.0
+    );
+    vBirth = aLifecycleState.w < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aLifecycleState.w + uTime);
+    float safeJumpStart = max(0.0, aJumpWindow.x);
+    float safeJumpEnd = max(safeJumpStart + 0.08, aJumpWindow.y);
     float jumpRise = smoothstep(safeJumpStart, safeJumpStart + 0.04, uTime);
     float jumpFallStart = max(safeJumpStart + 0.05, safeJumpEnd - 0.10);
     float jumpFall = 1.0 - smoothstep(jumpFallStart, safeJumpEnd, uTime);
-    vJumpPulse = step(0.0, aJumpStart) * jumpRise * jumpFall;
+    vJumpPulse = step(0.0, aJumpWindow.x) * jumpRise * jumpFall;
     vec4 mvPosition = modelViewMatrix * vec4(animatedPosition, 1.0);
     float twinkle = 1.0 + sin(uTime * 1.6 + animatedPosition.x * 0.07 + animatedPosition.z * 0.05) * 0.035 * vIntensity;
     float lifecycleScale = mix(1.0, 0.12, vLifecycle);
     float birthScale = mix(0.08, 1.0, vBirth);
     float jumpScale = mix(1.0, uJumpTargetScale, vJumpPulse);
-    gl_PointSize = clamp(animatedSize * lifecycleScale * birthScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 1.0, 110.0);
+    gl_PointSize = clamp(animatedSize * lifecycleScale * birthScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 5.5, 110.0);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -84,15 +90,15 @@ const fragmentShader = `
     if (radius > 1.0) discard;
 
     float angle = atan(p.y, p.x);
-    float fourRays = pow(abs(cos(angle * 2.0)), 18.0);
-    float eightRays = pow(abs(cos(angle * 4.0)), 34.0) * 0.42;
-    float starBoundary = 0.16 + fourRays * 0.49 + eightRays * 0.18;
-    float body = 1.0 - smoothstep(starBoundary, starBoundary + 0.075, radius);
-    float core = 1.0 - smoothstep(0.0, 0.13, radius);
-    float halo = exp(-4.8 * radius * radius) * 0.42;
+    float fourRays = pow(abs(cos(angle * 2.0)), 11.0);
+    float eightRays = pow(abs(cos(angle * 4.0)), 24.0);
+    float starBoundary = 0.13 + fourRays * 0.62 + eightRays * 0.16;
+    float body = 1.0 - smoothstep(starBoundary, starBoundary + 0.055, radius);
+    float core = 1.0 - smoothstep(0.0, 0.065, radius);
+    float halo = exp(-6.2 * radius * radius) * 0.20;
     float lifecycleVisibility = 1.0 - vLifecycle;
     float alpha = min(1.0, body + core + halo * vIntensity) * lifecycleVisibility * vBirth;
-    vec3 color = mix(vColor, vec3(1.0), core * 0.72) * lifecycleVisibility;
+    vec3 color = mix(vColor, vec3(1.0), core * 0.16) * lifecycleVisibility;
     float jumpBrightness = mix(1.0, uJumpTargetBrightness, vJumpPulse);
     gl_FragColor = vec4(color * (0.78 + core * 1.15 + halo * 0.35) * jumpBrightness, min(1.0, alpha * jumpBrightness));
   }
@@ -102,16 +108,17 @@ export interface GraphSceneOptions {
   onHover?: (node: SceneNode | null, x: number, y: number) => void;
   onStats?: (stats: { nodes: number; edges: number; fps: number }) => void;
   theme?: Partial<GraphTheme>;
+  timelapse?: Partial<TimelapseAnimationPreferences>;
 }
 
 interface ActiveRoute {
+  key: string;
   line: Line2;
   marker: THREE.Sprite;
   path: RoutePoint[];
   startedAt: number;
-  hopDelay: number;
   vertexCount: number;
-  ttl: number;
+  timing: TimelapseAnimationPreferences;
 }
 
 interface RoutePoint {
@@ -136,6 +143,7 @@ export class GraphScene {
   private readonly pointer = new THREE.Vector2(2, 2);
   private readonly resizeObserver: ResizeObserver;
   private theme: GraphTheme;
+  private timelapse: TimelapseAnimationPreferences;
   private readonly onHover?: GraphSceneOptions["onHover"];
   private readonly onStats?: GraphSceneOptions["onStats"];
   private points: THREE.Points | null = null;
@@ -143,14 +151,11 @@ export class GraphScene {
   private edgeCount = 0;
   private readonly jumpTexture = this.createJumpTexture();
   private transitionStartedAt = 0;
-  private readonly transitionDuration = 0.72;
+  private transitionDuration = 0.72;
   private nodes: SceneNode[] = [];
   private snapshot: SceneSnapshot | null = null;
   private activeRoutes: ActiveRoute[] = [];
-  private readonly activityRouteTiming = new Map<
-    string,
-    { startedAt: number; lastSeenAt: number }
-  >();
+  private readonly activityRouteSeenAt = new Map<string, number>();
   private animationFrame = 0;
   private hoverFrame = 0;
   private lastHovered = -1;
@@ -164,6 +169,7 @@ export class GraphScene {
       nodeColors: { ...DEFAULT_THEME.nodeColors, ...options.theme?.nodeColors },
       kanbanColors: { ...DEFAULT_THEME.kanbanColors, ...options.theme?.kanbanColors },
     };
+    this.timelapse = mergeTimelapseAnimation(options.timelapse || DEFAULT_TIMELAPSE);
     this.onHover = options.onHover;
     this.onStats = options.onStats;
     this.renderer = new THREE.WebGLRenderer({
@@ -200,29 +206,48 @@ export class GraphScene {
   setSnapshot(snapshot: SceneSnapshot): void {
     const previousVisuals = this.captureCurrentVisuals();
     this.snapshot = snapshot;
-    const now = Date.now() / 1000;
     const fadeSeconds = this.theme.kanbanFadeHours * 3600;
+    const lifecycle = resolveLifecycleVisuals(
+      snapshot.nodes,
+      snapshot.edges,
+      snapshot.asOf ?? Date.now() / 1000,
+      fadeSeconds,
+    );
     this.nodes = snapshot.nodes.filter((node) => {
-      if (node.kind !== "task" || node.status !== "done") return true;
-      const completedAt = Number(node.metadata?.completedAt || 0);
-      return !completedAt || now - completedAt < fadeSeconds;
+      const visual = lifecycle.get(node.id);
+      return !visual || visual.age < visual.duration;
     });
     const visibleIds = new Set(this.nodes.map((node) => node.id));
     const visibleEdges = snapshot.edges.filter(
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     );
+    const previousPositions = previousVisuals
+      ? new Map(
+          Array.from(previousVisuals, ([id, visual]) => [id, visual.position] as const),
+        )
+      : undefined;
     const positions = computeSpatialLayout(this.nodes, visibleEdges, {
       vaultRadius: this.theme.vaultRadius,
       runtimeOrbitRadius: this.theme.runtimeOrbitRadius,
+      previousPositions,
     });
     this.disposeGraph();
     this.transitionStartedAt = this.clock.elapsedTime;
-    this.points = this.createPoints(this.nodes, positions, previousVisuals);
+    this.points = this.createPoints(
+      this.nodes,
+      positions,
+      previousVisuals,
+      lifecycle,
+      snapshot.historical === true ? 0 : 1,
+    );
     this.edges = this.createEdges(this.nodes, visibleEdges, positions);
-    this.edgeCount = visibleEdges.length;
+    const byId = new Map(this.nodes.map((node) => [node.id, node]));
+    this.edgeCount = visibleEdges.filter(
+      (edge) => isPersistentEdge(edge, byId) || isActivityEdge(edge),
+    ).length;
     this.scene.add(this.edges, this.points);
     this.createActivityRoutes(this.nodes, visibleEdges, positions);
-    this.onStats?.({ nodes: this.nodes.length, edges: visibleEdges.length, fps: 0 });
+    this.onStats?.({ nodes: this.nodes.length, edges: this.edgeCount, fps: 0 });
   }
 
   setTheme(theme: Partial<GraphTheme>): void {
@@ -239,6 +264,14 @@ export class GraphScene {
     if (this.snapshot) this.setSnapshot(this.snapshot);
   }
 
+  setTransitionDuration(seconds: number): void {
+    this.transitionDuration = Math.max(0.08, Math.min(3, seconds));
+  }
+
+  setTimelapseAnimation(timing: Partial<TimelapseAnimationPreferences>): void {
+    this.timelapse = mergeTimelapseAnimation({ ...this.timelapse, ...timing });
+  }
+
   dispose(): void {
     cancelAnimationFrame(this.animationFrame);
     cancelAnimationFrame(this.hoverFrame);
@@ -246,6 +279,7 @@ export class GraphScene {
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerleave", this.handlePointerLeave);
     this.disposeGraph();
+    this.disposeActivityRoutes();
     this.controls.dispose();
     this.renderer.dispose();
     this.jumpTexture.dispose();
@@ -258,10 +292,7 @@ export class GraphScene {
     const positionsFrom = geometry.getAttribute("aPositionFrom") as THREE.BufferAttribute;
     const colors = geometry.getAttribute("aNodeColor") as THREE.BufferAttribute;
     const colorsFrom = geometry.getAttribute("aNodeColorFrom") as THREE.BufferAttribute;
-    const sizes = geometry.getAttribute("aSize") as THREE.BufferAttribute;
-    const sizesFrom = geometry.getAttribute("aSizeFrom") as THREE.BufferAttribute;
-    const intensities = geometry.getAttribute("aIntensity") as THREE.BufferAttribute;
-    const intensitiesFrom = geometry.getAttribute("aIntensityFrom") as THREE.BufferAttribute;
+    const sizeStates = geometry.getAttribute("aSizeState") as THREE.BufferAttribute;
     const rawProgress = Math.max(
       0,
       Math.min(
@@ -284,8 +315,8 @@ export class GraphScene {
           mix(colorsFrom.getY(index), colors.getY(index)),
           mix(colorsFrom.getZ(index), colors.getZ(index)),
         ],
-        size: mix(sizesFrom.getX(index), sizes.getX(index)),
-        intensity: mix(intensitiesFrom.getX(index), intensities.getX(index)),
+        size: mix(sizeStates.getY(index), sizeStates.getX(index)),
+        intensity: mix(sizeStates.getW(index), sizeStates.getZ(index)),
       });
     });
     return visuals;
@@ -295,21 +326,17 @@ export class GraphScene {
     nodes: SceneNode[],
     nodePositions: Map<string, Position>,
     previousVisuals: Map<string, NodeVisual> | null,
+    lifecycle: Map<string, LifecycleVisual>,
+    lifecycleRate: number,
   ): THREE.Points {
     const positions = new Float32Array(nodes.length * 3);
     const positionsFrom = new Float32Array(nodes.length * 3);
     const colors = new Float32Array(nodes.length * 3);
     const colorsFrom = new Float32Array(nodes.length * 3);
-    const sizes = new Float32Array(nodes.length);
-    const sizesFrom = new Float32Array(nodes.length);
-    const intensities = new Float32Array(nodes.length);
-    const intensitiesFrom = new Float32Array(nodes.length);
-    const doneAges = new Float32Array(nodes.length);
-    const bornAges = new Float32Array(nodes.length);
-    const jumpStarts = new Float32Array(nodes.length);
-    const jumpEnds = new Float32Array(nodes.length);
-    jumpStarts.fill(-1);
-    jumpEnds.fill(-1);
+    const sizeStates = new Float32Array(nodes.length * 4);
+    const lifecycleStates = new Float32Array(nodes.length * 4);
+    const jumpWindows = new Float32Array(nodes.length * 2);
+    jumpWindows.fill(-1);
     const low = new THREE.Color(this.theme.pressureLow);
     const high = new THREE.Color(this.theme.pressureHigh);
 
@@ -347,22 +374,29 @@ export class GraphScene {
         external: 5,
       };
       const baseSize = node.size ?? defaultSizes[node.kind] ?? this.theme.minNodeSize;
-      sizes[index] = baseSize * (1 + pressure * (this.theme.maxPressureScale - 1));
-      intensities[index] = node.status === "active" ? 1.2 : 0.72;
+      const size = baseSize * (1 + pressure * (this.theme.maxPressureScale - 1));
+      const intensity = node.status === "active" ? 1.2 : 0.72;
       const previous = previousVisuals?.get(node.id);
       const hasPreviousScene = previousVisuals !== null;
       positionsFrom.set(previous?.position || [x, y, z], index * 3);
       colorsFrom.set(previous?.color || [color.r, color.g, color.b], index * 3);
-      sizesFrom[index] = previous?.size ?? (hasPreviousScene ? sizes[index] * 0.12 : sizes[index]);
-      intensitiesFrom[index] = previous?.intensity ?? (hasPreviousScene ? 0 : intensities[index]);
-      const completedAt = Number(node.metadata?.completedAt || 0);
-      doneAges[index] = node.kind === "task" && node.status === "done" && completedAt
-        ? Math.max(0, Date.now() / 1000 - completedAt)
-        : -1;
+      const sizeFrom = previous?.size ?? (hasPreviousScene ? size * 0.12 : size);
+      const intensityFrom = previous?.intensity ?? (hasPreviousScene ? 0 : intensity);
+      sizeStates.set([size, sizeFrom, intensity, intensityFrom], index * 4);
+      const lifecycleVisual = lifecycle.get(node.id);
       const createdAt = Number(node.metadata?.createdAt || 0);
-      bornAges[index] = ["result", "artifact", "skill"].includes(node.kind) && createdAt
+      const bornAge = ["result", "artifact", "skill"].includes(node.kind) && createdAt
         ? Math.max(0, Date.now() / 1000 - createdAt)
         : -1;
+      lifecycleStates.set(
+        [
+          lifecycleVisual?.age ?? 0,
+          lifecycleVisual?.duration ?? 1,
+          lifecycleVisual ? 1 : 0,
+          bornAge,
+        ],
+        index * 4,
+      );
     });
 
     const geometry = new THREE.BufferGeometry();
@@ -370,14 +404,9 @@ export class GraphScene {
     geometry.setAttribute("aPositionFrom", new THREE.BufferAttribute(positionsFrom, 3));
     geometry.setAttribute("aNodeColor", new THREE.BufferAttribute(colors, 3));
     geometry.setAttribute("aNodeColorFrom", new THREE.BufferAttribute(colorsFrom, 3));
-    geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
-    geometry.setAttribute("aSizeFrom", new THREE.BufferAttribute(sizesFrom, 1));
-    geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
-    geometry.setAttribute("aIntensityFrom", new THREE.BufferAttribute(intensitiesFrom, 1));
-    geometry.setAttribute("aDoneAge", new THREE.BufferAttribute(doneAges, 1));
-    geometry.setAttribute("aBornAge", new THREE.BufferAttribute(bornAges, 1));
-    geometry.setAttribute("aJumpStart", new THREE.BufferAttribute(jumpStarts, 1));
-    geometry.setAttribute("aJumpEnd", new THREE.BufferAttribute(jumpEnds, 1));
+    geometry.setAttribute("aSizeState", new THREE.BufferAttribute(sizeStates, 4));
+    geometry.setAttribute("aLifecycleState", new THREE.BufferAttribute(lifecycleStates, 4));
+    geometry.setAttribute("aJumpWindow", new THREE.BufferAttribute(jumpWindows, 2));
     geometry.computeBoundingSphere();
 
     const material = new THREE.ShaderMaterial({
@@ -386,7 +415,7 @@ export class GraphScene {
       uniforms: {
         uPixelRatio: { value: this.renderer.getPixelRatio() },
         uTime: { value: 0 },
-        uKanbanFadeSeconds: { value: this.theme.kanbanFadeHours * 3600 },
+        uLifecycleRate: { value: lifecycleRate },
         uJumpTargetScale: { value: this.theme.jumpTargetScale },
         uJumpTargetBrightness: { value: this.theme.jumpTargetBrightness },
         uTransitionStart: { value: this.transitionStartedAt },
@@ -394,10 +423,15 @@ export class GraphScene {
       },
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      blending: THREE.NormalBlending,
+      toneMapped: false,
       vertexColors: true,
     });
-    return new THREE.Points(geometry, material);
+    const points = new THREE.Points(geometry, material);
+    points.frustumCulled = false;
+    points.renderOrder = 2;
+    return points;
   }
 
   private createEdges(
@@ -406,10 +440,10 @@ export class GraphScene {
     nodePositions: Map<string, Position>,
   ): LineSegments2 {
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]));
+    const byId = new Map(nodes.map((node) => [node.id, node]));
     const validEdges = edges.filter(
       (edge) =>
-        edge.active !== false &&
-        !JUMP_EDGE_KINDS.has(edge.kind) &&
+        isPersistentEdge(edge, byId) &&
         nodeIndex.has(edge.source) &&
         nodeIndex.has(edge.target),
     );
@@ -440,7 +474,9 @@ export class GraphScene {
       Math.max(1, this.canvas.clientWidth),
       Math.max(1, this.canvas.clientHeight),
     );
-    return new LineSegments2(geometry, material);
+    const lines = new LineSegments2(geometry, material);
+    lines.renderOrder = 1;
+    return lines;
   }
 
   private createActivityRoutes(
@@ -455,29 +491,39 @@ export class GraphScene {
       .map((node) => ({ id: node.id, position: positions.get(node.id)! }));
     const activityEdges = edges
       .filter((edge) => {
-        if (!JUMP_EDGE_KINDS.has(edge.kind)) return false;
+        if (!isActivityEdge(edge)) return false;
         const source = byId.get(edge.source);
         const target = byId.get(edge.target);
         // Expiry is authoritative in the SQLite projection. This filter only
         // guards malformed snapshots; route animation itself is presentation.
         return Boolean(source) && Boolean(target);
       })
+      .sort((left, right) => {
+        const delegationPriority = Number(right.kind === "delegated") - Number(left.kind === "delegated");
+        if (delegationPriority !== 0) return delegationPriority;
+        return Number(right.metadata?.createdAt || 0) - Number(left.metadata?.createdAt || 0);
+      })
       .slice(0, 20);
     const sceneNow = this.clock.elapsedTime;
+    const activeByKey = new Map(this.activeRoutes.map((route) => [route.key, route]));
     const plannedStarts = new Map<string, number>();
     const toolReadyAt = new Map<string, number>();
     const timingKeyFor = (edge: SceneEdge) =>
       `${edge.id}:${Number(edge.metadata?.createdAt || 0)}`;
     activityEdges.forEach((edge, index) => {
       if (edge.kind !== "called") return;
-      const existing = this.activityRouteTiming.get(timingKeyFor(edge));
+      const existing = activeByKey.get(timingKeyFor(edge));
       const start = existing?.startedAt ?? sceneNow + index * 0.012;
       plannedStarts.set(edge.id, start);
-      toolReadyAt.set(edge.target, start + 0.07);
+      toolReadyAt.set(
+        edge.target,
+        start +
+          (existing?.timing.jumpDurationSeconds ?? this.timelapse.jumpDurationSeconds),
+      );
     });
     activityEdges.forEach((edge, index) => {
       if (plannedStarts.has(edge.id)) return;
-      const existing = this.activityRouteTiming.get(timingKeyFor(edge));
+      const existing = activeByKey.get(timingKeyFor(edge));
       const naturalStart = sceneNow + index * 0.012;
       plannedStarts.set(
         edge.id,
@@ -486,6 +532,15 @@ export class GraphScene {
     });
 
     activityEdges.forEach((edge) => {
+      const timingKey = timingKeyFor(edge);
+      const existingRoute = activeByKey.get(timingKey);
+      const seenBefore = this.activityRouteSeenAt.has(timingKey);
+      this.activityRouteSeenAt.set(timingKey, sceneNow);
+      if (existingRoute) {
+        this.markRouteJumpWindows(nodeIndex, existingRoute, edge.kind);
+        return;
+      }
+      if (seenBefore) return;
       const source = positions.get(edge.source);
       const target = positions.get(edge.target);
       if (!source || !target) return;
@@ -534,38 +589,49 @@ export class GraphScene {
       marker.visible = false;
       this.scene.add(line);
       this.scene.add(marker);
-      const timingKey = timingKeyFor(edge);
-      const existingTiming = this.activityRouteTiming.get(timingKey);
-      const startedAt = existingTiming?.startedAt ?? plannedStarts.get(edge.id)!;
-      this.activityRouteTiming.set(timingKey, { startedAt, lastSeenAt: sceneNow });
-      const hopDelay =
-        path.length <= 2
-          ? 0.07
-          : Math.max(0.008, this.theme.activityHopDelayMs / 1000);
-      this.activeRoutes.push({
+      const route: ActiveRoute = {
+        key: timingKey,
         line,
         marker,
         path,
-        startedAt,
-        hopDelay,
+        startedAt: plannedStarts.get(edge.id)!,
         vertexCount: path.length,
-        ttl: this.theme.activityTtlSeconds,
-      });
-      const completion = startedAt + (path.length - 1) * hopDelay;
-      if (["retrieved", "returned"].includes(edge.kind)) {
-        this.markJumpWindow(nodeIndex, edge.source, startedAt, completion + 0.18);
-      }
-      for (let pathIndex = 1; pathIndex < path.length; pathIndex += 1) {
-        const arrival = startedAt + pathIndex * hopDelay;
-        const isFinal = pathIndex === path.length - 1;
-        const hold = isFinal ? 0.55 : Math.max(0.14, hopDelay * 3.5);
-        this.markJumpWindow(nodeIndex, path[pathIndex].id, arrival, arrival + hold);
-      }
+        timing: { ...this.timelapse },
+      };
+      this.activeRoutes.push(route);
+      activeByKey.set(timingKey, route);
+      this.markRouteJumpWindows(nodeIndex, route, edge.kind);
     });
-    for (const [key, timing] of this.activityRouteTiming) {
-      if (sceneNow - timing.lastSeenAt > this.theme.activityTtlSeconds + 2) {
-        this.activityRouteTiming.delete(key);
+    for (const [key, lastSeenAt] of this.activityRouteSeenAt) {
+      if (sceneNow - lastSeenAt > this.theme.activityTtlSeconds + 12) {
+        this.activityRouteSeenAt.delete(key);
       }
+    }
+  }
+
+  private markRouteJumpWindows(
+    nodeIndex: Map<string, number>,
+    route: ActiveRoute,
+    edgeKind?: string,
+  ): void {
+    const segmentCount = Math.max(1, route.vertexCount - 1);
+    const hopDuration = route.timing.jumpDurationSeconds / segmentCount;
+    const completion = route.startedAt + route.timing.jumpDurationSeconds;
+    if (["retrieved", "returned"].includes(edgeKind || "")) {
+      this.markJumpWindow(
+        nodeIndex,
+        route.path[0].id,
+        route.startedAt,
+        completion + route.timing.fadeDurationSeconds,
+      );
+    }
+    for (let pathIndex = 1; pathIndex < route.path.length; pathIndex += 1) {
+      const arrival = route.startedAt + pathIndex * hopDuration;
+      const isFinal = pathIndex === route.path.length - 1;
+      const hold = isFinal
+        ? route.timing.fadeDurationSeconds
+        : Math.max(0.14, hopDuration * 1.5);
+      this.markJumpWindow(nodeIndex, route.path[pathIndex].id, arrival, arrival + hold);
     }
   }
 
@@ -577,18 +643,17 @@ export class GraphScene {
   ): void {
     const index = nodeIndex.get(nodeId);
     if (index === undefined || !this.points) return;
-    const startAttribute = this.points.geometry.getAttribute(
-      "aJumpStart",
+    const jumpWindow = this.points.geometry.getAttribute(
+      "aJumpWindow",
     ) as THREE.BufferAttribute;
-    const endAttribute = this.points.geometry.getAttribute(
-      "aJumpEnd",
-    ) as THREE.BufferAttribute;
-    const currentStart = startAttribute.getX(index);
-    const currentEnd = endAttribute.getX(index);
-    startAttribute.setX(index, currentStart < 0 ? start : Math.min(currentStart, start));
-    endAttribute.setX(index, Math.max(currentEnd, end));
-    startAttribute.needsUpdate = true;
-    endAttribute.needsUpdate = true;
+    const currentStart = jumpWindow.getX(index);
+    const currentEnd = jumpWindow.getY(index);
+    jumpWindow.setXY(
+      index,
+      currentStart < 0 ? start : Math.min(currentStart, start),
+      Math.max(currentEnd, end),
+    );
+    jumpWindow.needsUpdate = true;
   }
 
   private buildBeautifulRoute(
@@ -644,15 +709,23 @@ export class GraphScene {
   }
 
   private updateActivityRoutes(now: number): void {
+    const retained: ActiveRoute[] = [];
     for (const route of this.activeRoutes) {
       const elapsed = now - route.startedAt;
+      const segmentCount = route.vertexCount - 1;
+      const frame = resolveRouteAnimationFrame(elapsed, segmentCount, route.timing);
+      if (frame.complete) {
+        this.disposeActivityRoute(route);
+        continue;
+      }
+      retained.push(route);
       if (elapsed < 0) {
         route.line.geometry.instanceCount = 0;
+        route.line.visible = false;
         route.marker.visible = false;
         continue;
       }
-      const segmentCount = route.vertexCount - 1;
-      const segmentProgress = elapsed / route.hopDelay;
+      const segmentProgress = frame.segmentProgress;
       const completedSegments = Math.min(segmentCount, Math.floor(segmentProgress));
       route.line.geometry.instanceCount = completedSegments;
       if (completedSegments < segmentCount) {
@@ -669,12 +742,11 @@ export class GraphScene {
       } else {
         route.marker.visible = false;
       }
-      const completion = (route.vertexCount - 1) * route.hopDelay;
-      const linger = elapsed - completion;
-      route.line.material.opacity = linger <= 0 ? 0.38 : Math.max(0, 0.38 * (1 - linger / route.ttl));
-      route.line.visible = linger < route.ttl;
-      route.marker.material.opacity = linger <= 0 ? 0.95 : 0;
+      route.line.material.opacity = frame.lineOpacity;
+      route.line.visible = frame.visible;
+      route.marker.material.opacity = elapsed <= route.timing.jumpDurationSeconds ? 0.95 : 0;
     }
+    this.activeRoutes = retained;
   }
 
   private readonly handlePointerMove = (event: PointerEvent): void => {
@@ -752,7 +824,6 @@ export class GraphScene {
     if (material?.uniforms.uTime) material.uniforms.uTime.value = elapsedTime;
     this.updateActivityRoutes(elapsedTime);
     this.renderer.render(this.scene, this.camera);
-
     this.frameCount += 1;
     const now = performance.now();
     if (now - this.frameWindowStart >= 1000) {
@@ -768,14 +839,6 @@ export class GraphScene {
   };
 
   private disposeGraph(): void {
-    for (const route of this.activeRoutes) {
-      this.scene.remove(route.line);
-      this.scene.remove(route.marker);
-      route.line.geometry.dispose();
-      route.line.material.dispose();
-      route.marker.material.dispose();
-    }
-    this.activeRoutes = [];
     if (this.points) {
       this.scene.remove(this.points);
       this.points.geometry.dispose();
@@ -788,5 +851,18 @@ export class GraphScene {
       (this.edges.material as THREE.Material).dispose();
       this.edges = null;
     }
+  }
+
+  private disposeActivityRoute(route: ActiveRoute): void {
+    this.scene.remove(route.line);
+    this.scene.remove(route.marker);
+    route.line.geometry.dispose();
+    route.line.material.dispose();
+    route.marker.material.dispose();
+  }
+
+  private disposeActivityRoutes(): void {
+    for (const route of this.activeRoutes) this.disposeActivityRoute(route);
+    this.activeRoutes = [];
   }
 }

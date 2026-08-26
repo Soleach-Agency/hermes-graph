@@ -78,8 +78,8 @@ class RuntimeHydrationTests(unittest.TestCase):
         nodes = {node["id"]: node for node in snapshot["nodes"]}
         root_session = hooks._id("session", "root-1")
         child_session = hooks._id("session", "child-1")
-        root_agent = hooks._id("agent", "runtime:luna:root-1")
-        child_agent = hooks._id("agent", "runtime:luna:child-1")
+        root_agent = hooks._id("agent", "root-1")
+        child_agent = hooks._id("agent", "child-1")
 
         self.assertEqual(result["hydratedSessions"], 2)
         self.assertEqual(nodes[root_session]["status"], "active")
@@ -154,8 +154,8 @@ class RuntimeHydrationTests(unittest.TestCase):
         edges = storage.get_snapshot()["edges"]
         root_session = hooks._id("session", "root-1")
         child_session = hooks._id("session", "child-1")
-        root_agent = hooks._id("agent", "runtime:default:root-1")
-        child_agent = hooks._id("agent", "runtime:luna:child-1")
+        root_agent = hooks._id("agent", "root-1")
+        child_agent = hooks._id("agent", "child-1")
 
         self.assertTrue(
             any(
