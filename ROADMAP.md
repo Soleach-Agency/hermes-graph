@@ -29,8 +29,12 @@ editable tool routing overrides, configurable Vault result-field mapping,
 generic extraction from nested MCP text envelopes, freely draggable timeline
 scrubbing, frame-driven playback with overlapping easing, and stable runtime
 placement that puts new owners into open space without displacing existing ones.
+Playback timing is configurable in two mutually exclusive modes: a fixed total
+run duration for any selected window, or a real-duration scale per source-time
+hour. Each mode retains its own value and seconds/minutes/hours unit, and the
+preference is persisted with the rest of the graph settings.
 Community defaults contain no Soleach- or vendor-specific tool rules. Local
-verification currently covers 40 backend tests, eight frontend tests, and the
+verification currently covers 40 backend tests, ten frontend tests, and the
 production build. Live Soleach validation resolved three RAG result paths to
 three real Vault nodes and emitted three temporary `retrieved` edges. All seven
 Soleach profile-local plugin copies carry the exact current candidate commit;
