@@ -74,6 +74,8 @@ export interface PlaybackPreferences {
 export interface TimelapseAnimationPreferences {
   jumpDurationSeconds: number;
   fadeDurationSeconds: number;
+  nodeBirthDurationSeconds: number;
+  nodeFadeDurationSeconds: number;
 }
 
 export interface GraphTheme {
@@ -153,4 +155,6 @@ export const DEFAULT_PLAYBACK: PlaybackPreferences = {
 export const DEFAULT_TIMELAPSE: TimelapseAnimationPreferences = {
   jumpDurationSeconds: 1,
   fadeDurationSeconds: 2,
+  nodeBirthDurationSeconds: 1,
+  nodeFadeDurationSeconds: 2,
 };

@@ -9,6 +9,32 @@ export interface LifecycleVisual {
 const COMPLETED_STATUSES = new Set(["done", "completed", "stopped", "reset"]);
 const OWNER_EDGE_KINDS = new Set(["belongs_to", "works_on"]);
 
+export function smoothstepProgress(elapsed: number, duration: number): number {
+  const progress = Math.max(0, Math.min(1, elapsed / Math.max(0.001, duration)));
+  return progress * progress * (3 - 2 * progress);
+}
+
+export function resolveNodeAnimationFrame(
+  birthAge: number,
+  birthDuration: number,
+  fadeAge = -1,
+  fadeDuration = 1,
+): { scaleProgress: number; visibility: number } {
+  const birthProgress = smoothstepProgress(birthAge, birthDuration);
+  if (fadeAge < 0) {
+    return { scaleProgress: birthProgress, visibility: birthProgress };
+  }
+  const birthAtFade = smoothstepProgress(
+    Math.max(0, birthAge - fadeAge),
+    birthDuration,
+  );
+  const fadeProgress = smoothstepProgress(fadeAge, fadeDuration);
+  return {
+    scaleProgress: birthAtFade * (1 - fadeProgress),
+    visibility: birthAtFade * (1 - fadeProgress),
+  };
+}
+
 function completedAt(node: SceneNode): number | null {
   if (!COMPLETED_STATUSES.has(String(node.status || "").toLowerCase())) return null;
   const value = Number(node.metadata?.completedAt || 0);

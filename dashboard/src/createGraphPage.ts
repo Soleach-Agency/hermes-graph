@@ -799,14 +799,14 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           h(
             "label",
             { className: "hg-scale-row" },
-            h("span", null, `done fade ${theme.kanbanFadeHours}h`),
+            h("span", null, `done retention ${theme.kanbanFadeHours}h`),
             h("input", {
               type: "range",
               min: 6,
               max: 48,
               step: 1,
               value: theme.kanbanFadeHours,
-              "aria-label": "Kanban done fade hours",
+              "aria-label": "Kanban done retention hours",
               onChange: (event: Event) =>
                 previewTheme({
                   ...theme,
@@ -981,7 +981,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           h(
             "label",
             { className: "hg-scale-row" },
-            h("span", null, `fade duration ${timelapse.fadeDurationSeconds.toFixed(1)}s`),
+            h("span", null, `jump fade ${timelapse.fadeDurationSeconds.toFixed(1)}s`),
             h("input", {
               type: "range",
               min: 0.2,
@@ -992,6 +992,40 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
               onChange: (event: Event) =>
                 previewTimelapse({
                   fadeDurationSeconds: Number((event.target as HTMLInputElement).value),
+                }),
+            }),
+          ),
+          h(
+            "label",
+            { className: "hg-scale-row" },
+            h("span", null, `node appear ${timelapse.nodeBirthDurationSeconds.toFixed(1)}s`),
+            h("input", {
+              type: "range",
+              min: 0.1,
+              max: 10,
+              step: 0.1,
+              value: timelapse.nodeBirthDurationSeconds,
+              "aria-label": "Node appearance duration seconds",
+              onChange: (event: Event) =>
+                previewTimelapse({
+                  nodeBirthDurationSeconds: Number((event.target as HTMLInputElement).value),
+                }),
+            }),
+          ),
+          h(
+            "label",
+            { className: "hg-scale-row" },
+            h("span", null, `node disappear ${timelapse.nodeFadeDurationSeconds.toFixed(1)}s`),
+            h("input", {
+              type: "range",
+              min: 0.2,
+              max: 10,
+              step: 0.1,
+              value: timelapse.nodeFadeDurationSeconds,
+              "aria-label": "Node disappearance duration seconds",
+              onChange: (event: Event) =>
+                previewTimelapse({
+                  nodeFadeDurationSeconds: Number((event.target as HTMLInputElement).value),
                 }),
             }),
           ),

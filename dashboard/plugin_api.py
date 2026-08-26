@@ -72,6 +72,8 @@ class PlaybackPreferences(BaseModel):
 class TimelapseAnimationPreferences(BaseModel):
     jumpDurationSeconds: float = Field(default=1, ge=0.1, le=10)
     fadeDurationSeconds: float = Field(default=2, ge=0.2, le=10)
+    nodeBirthDurationSeconds: float = Field(default=1, ge=0.1, le=10)
+    nodeFadeDurationSeconds: float = Field(default=2, ge=0.2, le=10)
 
 
 class GraphPreferences(BaseModel):

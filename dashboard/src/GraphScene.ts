@@ -7,7 +7,7 @@ import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
 import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 
 import { computeSpatialLayout, type Position } from "./layout";
-import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
+import { resolveLifecycleVisuals, smoothstepProgress } from "./lifecycle";
 import { isActivityEdge, isPersistentEdge } from "./edgePolicy";
 import {
   mergeTimelapseAnimation,
@@ -37,7 +37,7 @@ const vertexShader = `
   varying float vJumpPulse;
   uniform float uPixelRatio;
   uniform float uTime;
-  uniform float uLifecycleRate;
+  uniform float uNodeBirthDuration;
   uniform float uJumpTargetScale;
   uniform float uTransitionStart;
   uniform float uTransitionDuration;
@@ -52,13 +52,20 @@ const vertexShader = `
     float animatedSize = mix(aSizeState.y, aSizeState.x, transition);
     vColor = mix(aNodeColorFrom, aNodeColor, transition);
     vIntensity = mix(aSizeState.w, aSizeState.z, transition);
-    float liveLifecycleElapsed = max(0.0, uTime - uTransitionStart) * uLifecycleRate;
-    vLifecycle = aLifecycleState.z * clamp(
-      (aLifecycleState.x + liveLifecycleElapsed) / max(1.0, aLifecycleState.y),
-      0.0,
-      1.0
-    );
-    vBirth = aLifecycleState.w < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aLifecycleState.w + uTime);
+    float animationElapsed = max(0.0, uTime - uTransitionStart);
+    bool isFading = aLifecycleState.x >= 0.0;
+    vLifecycle = isFading
+      ? smoothstep(0.0, max(0.001, aLifecycleState.y), aLifecycleState.x + animationElapsed)
+      : 0.0;
+    float birthProgress = aLifecycleState.z < 0.0
+      ? 1.0
+      : smoothstep(
+          0.0,
+          max(0.001, uNodeBirthDuration),
+          aLifecycleState.z + animationElapsed
+        );
+    float birthAtFade = clamp(aLifecycleState.w, 0.0, 1.0);
+    vBirth = isFading ? birthAtFade : birthProgress;
     float safeJumpStart = max(0.0, aJumpWindow.x);
     float safeJumpEnd = max(safeJumpStart + 0.08, aJumpWindow.y);
     float jumpRise = smoothstep(safeJumpStart, safeJumpStart + 0.04, uTime);
@@ -67,10 +74,13 @@ const vertexShader = `
     vJumpPulse = step(0.0, aJumpWindow.x) * jumpRise * jumpFall;
     vec4 mvPosition = modelViewMatrix * vec4(animatedPosition, 1.0);
     float twinkle = 1.0 + sin(uTime * 1.6 + animatedPosition.x * 0.07 + animatedPosition.z * 0.05) * 0.035 * vIntensity;
-    float lifecycleScale = mix(1.0, 0.12, vLifecycle);
-    float birthScale = mix(0.08, 1.0, vBirth);
+    float birthScale = mix(0.08, 1.0, birthProgress);
+    float scaleAtFade = mix(0.08, 1.0, birthAtFade);
+    float lifecycleScale = isFading
+      ? mix(scaleAtFade, 0.08, vLifecycle)
+      : birthScale;
     float jumpScale = mix(1.0, uJumpTargetScale, vJumpPulse);
-    gl_PointSize = clamp(animatedSize * lifecycleScale * birthScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 5.5, 110.0);
+    gl_PointSize = clamp(animatedSize * lifecycleScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 5.5, 110.0);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -133,6 +143,13 @@ interface NodeVisual {
   intensity: number;
 }
 
+interface NodeAnimationVisual {
+  birthAge: number;
+  fadeAge: number;
+  fadeDuration: number;
+  birthProgressAtFade: number;
+}
+
 export class GraphScene {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
@@ -161,6 +178,10 @@ export class GraphScene {
   private lastHovered = -1;
   private frameCount = 0;
   private frameWindowStart = performance.now();
+  private readonly nodeBirthStartedAt = new Map<string, number>();
+  private readonly nodeFadeStartedAt = new Map<string, number>();
+  private readonly nodeCache = new Map<string, SceneNode>();
+  private lifecycleTimer = 0;
 
   constructor(private readonly canvas: HTMLCanvasElement, options: GraphSceneOptions = {}) {
     this.theme = {
@@ -204,19 +225,76 @@ export class GraphScene {
   }
 
   setSnapshot(snapshot: SceneSnapshot): void {
-    const previousVisuals = this.captureCurrentVisuals();
-    this.snapshot = snapshot;
-    const fadeSeconds = this.theme.kanbanFadeHours * 3600;
-    const lifecycle = resolveLifecycleVisuals(
+    const rewound = this.snapshot !== null && snapshot.cursor < this.snapshot.cursor;
+    const previousVisuals = rewound ? null : this.captureCurrentVisuals();
+    if (rewound) {
+      this.nodeBirthStartedAt.clear();
+      this.nodeFadeStartedAt.clear();
+      this.nodeCache.clear();
+      this.nodes = [];
+    }
+    const now = this.clock.elapsedTime;
+    const hadSnapshot = this.snapshot !== null && !rewound;
+    const completed = resolveLifecycleVisuals(
       snapshot.nodes,
       snapshot.edges,
       snapshot.asOf ?? Date.now() / 1000,
-      fadeSeconds,
+      1,
     );
-    this.nodes = snapshot.nodes.filter((node) => {
-      const visual = lifecycle.get(node.id);
-      return !visual || visual.age < visual.duration;
+    const incomingIds = new Set(snapshot.nodes.map((node) => node.id));
+    for (const node of snapshot.nodes) {
+      if (!this.nodeBirthStartedAt.has(node.id)) {
+        this.nodeBirthStartedAt.set(
+          node.id,
+          hadSnapshot ? now : now - this.timelapse.nodeBirthDurationSeconds,
+        );
+      }
+      this.nodeCache.set(node.id, node);
+      if (completed.has(node.id) && !this.nodeFadeStartedAt.has(node.id)) {
+        this.nodeFadeStartedAt.set(node.id, now);
+      } else if (!completed.has(node.id)) {
+        this.nodeFadeStartedAt.delete(node.id);
+      }
+    }
+    for (const node of this.nodes) {
+      if (!incomingIds.has(node.id) && !this.nodeFadeStartedAt.has(node.id)) {
+        this.nodeFadeStartedAt.set(node.id, now);
+      }
+    }
+    const candidates = new Map(snapshot.nodes.map((node) => [node.id, node]));
+    for (const node of this.nodes) {
+      if (!incomingIds.has(node.id)) candidates.set(node.id, this.nodeCache.get(node.id) || node);
+    }
+    const animations = new Map<string, NodeAnimationVisual>();
+    this.nodes = Array.from(candidates.values()).filter((node) => {
+      const birthStartedAt = this.nodeBirthStartedAt.get(node.id) ?? now;
+      const fadeStartedAt = this.nodeFadeStartedAt.get(node.id);
+      const fadeAge = fadeStartedAt === undefined ? -1 : Math.max(0, now - fadeStartedAt);
+      if (fadeAge >= this.timelapse.nodeFadeDurationSeconds) return false;
+      animations.set(node.id, {
+        birthAge: Math.max(0, now - birthStartedAt),
+        fadeAge,
+        fadeDuration: this.timelapse.nodeFadeDurationSeconds,
+        birthProgressAtFade: fadeStartedAt === undefined
+          ? 1
+          : smoothstepProgress(
+              Math.max(0, fadeStartedAt - birthStartedAt),
+              this.timelapse.nodeBirthDurationSeconds,
+            ),
+      });
+      return true;
     });
+    this.snapshot = snapshot;
+    window.clearTimeout(this.lifecycleTimer);
+    const remainingFades = Array.from(animations.values())
+      .filter((animation) => animation.fadeAge >= 0)
+      .map((animation) => animation.fadeDuration - animation.fadeAge);
+    if (remainingFades.length) {
+      this.lifecycleTimer = window.setTimeout(
+        () => this.snapshot && this.setSnapshot(this.snapshot),
+        Math.max(20, Math.min(...remainingFades) * 1_000 + 20),
+      );
+    }
     const visibleIds = new Set(this.nodes.map((node) => node.id));
     const visibleEdges = snapshot.edges.filter(
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
@@ -237,8 +315,7 @@ export class GraphScene {
       this.nodes,
       positions,
       previousVisuals,
-      lifecycle,
-      snapshot.historical === true ? 0 : 1,
+      animations,
     );
     this.edges = this.createEdges(this.nodes, visibleEdges, positions);
     const byId = new Map(this.nodes.map((node) => [node.id, node]));
@@ -270,11 +347,13 @@ export class GraphScene {
 
   setTimelapseAnimation(timing: Partial<TimelapseAnimationPreferences>): void {
     this.timelapse = mergeTimelapseAnimation({ ...this.timelapse, ...timing });
+    if (this.snapshot) this.setSnapshot(this.snapshot);
   }
 
   dispose(): void {
     cancelAnimationFrame(this.animationFrame);
     cancelAnimationFrame(this.hoverFrame);
+    window.clearTimeout(this.lifecycleTimer);
     this.resizeObserver.disconnect();
     this.canvas.removeEventListener("pointermove", this.handlePointerMove);
     this.canvas.removeEventListener("pointerleave", this.handlePointerLeave);
@@ -326,8 +405,7 @@ export class GraphScene {
     nodes: SceneNode[],
     nodePositions: Map<string, Position>,
     previousVisuals: Map<string, NodeVisual> | null,
-    lifecycle: Map<string, LifecycleVisual>,
-    lifecycleRate: number,
+    animations: Map<string, NodeAnimationVisual>,
   ): THREE.Points {
     const positions = new Float32Array(nodes.length * 3);
     const positionsFrom = new Float32Array(nodes.length * 3);
@@ -377,23 +455,18 @@ export class GraphScene {
       const size = baseSize * (1 + pressure * (this.theme.maxPressureScale - 1));
       const intensity = node.status === "active" ? 1.2 : 0.72;
       const previous = previousVisuals?.get(node.id);
-      const hasPreviousScene = previousVisuals !== null;
       positionsFrom.set(previous?.position || [x, y, z], index * 3);
       colorsFrom.set(previous?.color || [color.r, color.g, color.b], index * 3);
-      const sizeFrom = previous?.size ?? (hasPreviousScene ? size * 0.12 : size);
-      const intensityFrom = previous?.intensity ?? (hasPreviousScene ? 0 : intensity);
+      const sizeFrom = previous?.size ?? size;
+      const intensityFrom = previous?.intensity ?? intensity;
       sizeStates.set([size, sizeFrom, intensity, intensityFrom], index * 4);
-      const lifecycleVisual = lifecycle.get(node.id);
-      const createdAt = Number(node.metadata?.createdAt || 0);
-      const bornAge = ["result", "artifact", "skill"].includes(node.kind) && createdAt
-        ? Math.max(0, Date.now() / 1000 - createdAt)
-        : -1;
+      const animation = animations.get(node.id);
       lifecycleStates.set(
         [
-          lifecycleVisual?.age ?? 0,
-          lifecycleVisual?.duration ?? 1,
-          lifecycleVisual ? 1 : 0,
-          bornAge,
+          animation?.fadeAge ?? -1,
+          animation?.fadeDuration ?? this.timelapse.nodeFadeDurationSeconds,
+          animation?.birthAge ?? -1,
+          animation?.birthProgressAtFade ?? 1,
         ],
         index * 4,
       );
@@ -415,7 +488,7 @@ export class GraphScene {
       uniforms: {
         uPixelRatio: { value: this.renderer.getPixelRatio() },
         uTime: { value: 0 },
-        uLifecycleRate: { value: lifecycleRate },
+        uNodeBirthDuration: { value: this.timelapse.nodeBirthDurationSeconds },
         uJumpTargetScale: { value: this.theme.jumpTargetScale },
         uJumpTargetBrightness: { value: this.theme.jumpTargetBrightness },
         uTransitionStart: { value: this.transitionStartedAt },

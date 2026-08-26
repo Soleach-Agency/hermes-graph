@@ -33,6 +33,13 @@ describe("timelapse route animation", () => {
     expect(mergeTimelapseAnimation({
       jumpDurationSeconds: 99,
       fadeDurationSeconds: 0.01,
-    })).toEqual({ jumpDurationSeconds: 10, fadeDurationSeconds: 0.2 });
+      nodeBirthDurationSeconds: 99,
+      nodeFadeDurationSeconds: 0.01,
+    })).toEqual({
+      jumpDurationSeconds: 10,
+      fadeDurationSeconds: 0.2,
+      nodeBirthDurationSeconds: 10,
+      nodeFadeDurationSeconds: 0.2,
+    });
   });
 });

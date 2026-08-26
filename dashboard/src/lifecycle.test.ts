@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveLifecycleVisuals } from "./lifecycle";
+import { resolveLifecycleVisuals, resolveNodeAnimationFrame } from "./lifecycle";
 
 describe("completed lifecycle visuals", () => {
   it("fades tools before their completed session and agent", () => {
@@ -33,5 +33,17 @@ describe("completed lifecycle visuals", () => {
 
     expect(visuals.has("task")).toBe(true);
     expect(visuals.has("profile")).toBe(false);
+  });
+
+  it("interrupts an unfinished birth and fades from the reached size", () => {
+    const beforeFade = resolveNodeAnimationFrame(0.5, 1);
+    const fadeStart = resolveNodeAnimationFrame(0.5, 1, 0, 2);
+    const halfwayOut = resolveNodeAnimationFrame(1.5, 1, 1, 2);
+    const gone = resolveNodeAnimationFrame(2.5, 1, 2, 2);
+
+    expect(beforeFade.scaleProgress).toBeCloseTo(0.5, 5);
+    expect(fadeStart.scaleProgress).toBeCloseTo(beforeFade.scaleProgress, 5);
+    expect(halfwayOut.scaleProgress).toBeCloseTo(0.25, 5);
+    expect(gone).toEqual({ scaleProgress: 0, visibility: 0 });
   });
 });
