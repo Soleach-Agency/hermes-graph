@@ -49,8 +49,9 @@ untouched.
   text labels without ever storing complete result bodies.
 - Validate the current candidate against additional supported Hermes versions;
   the real-host matrix is presently anchored to Hermes 0.20.5.
-- Merge, tag, and publish `0.2.0` after an authenticated visual settings/fade
-  smoke pass is recorded.
+- Merge, tag, and publish `0.2.0` after an authenticated visual smoke pass records
+  saved settings, fade ordering, a live RAG jump, and timeline playback over real
+  retained event history.
 
 ## Deliberately later
 
