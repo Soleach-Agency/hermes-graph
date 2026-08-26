@@ -8,6 +8,7 @@ import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeome
 
 import { computeSpatialLayout, type Position } from "./layout";
 import { resolveLifecycleVisuals, type LifecycleVisual } from "./lifecycle";
+import { isActivityEdge, isPersistentVaultEdge } from "./edgePolicy";
 import {
   DEFAULT_THEME,
   type GraphTheme,
@@ -16,21 +17,12 @@ import {
   type SceneSnapshot,
 } from "./types";
 
-const JUMP_EDGE_KINDS = new Set(["called", "retrieved", "returned"]);
-
 const vertexShader = `
-  attribute float aSize;
-  attribute float aSizeFrom;
+  attribute vec4 aSizeState;
   attribute vec3 aNodeColor;
   attribute vec3 aNodeColorFrom;
-  attribute float aIntensity;
-  attribute float aIntensityFrom;
-  attribute float aLifecycleAge;
-  attribute float aLifecycleDuration;
-  attribute float aLifecycleEligible;
-  attribute float aBornAge;
-  attribute float aJumpStart;
-  attribute float aJumpEnd;
+  attribute vec4 aLifecycleState;
+  attribute vec2 aJumpWindow;
   attribute vec3 aPositionFrom;
   varying vec3 vColor;
   varying float vIntensity;
@@ -51,28 +43,28 @@ const vertexShader = `
       clamp((uTime - uTransitionStart) / max(0.001, uTransitionDuration), 0.0, 1.0)
     );
     vec3 animatedPosition = mix(aPositionFrom, position, transition);
-    float animatedSize = mix(aSizeFrom, aSize, transition);
+    float animatedSize = mix(aSizeState.y, aSizeState.x, transition);
     vColor = mix(aNodeColorFrom, aNodeColor, transition);
-    vIntensity = mix(aIntensityFrom, aIntensity, transition);
+    vIntensity = mix(aSizeState.w, aSizeState.z, transition);
     float liveLifecycleElapsed = max(0.0, uTime - uTransitionStart) * uLifecycleRate;
-    vLifecycle = aLifecycleEligible * clamp(
-      (aLifecycleAge + liveLifecycleElapsed) / max(1.0, aLifecycleDuration),
+    vLifecycle = aLifecycleState.z * clamp(
+      (aLifecycleState.x + liveLifecycleElapsed) / max(1.0, aLifecycleState.y),
       0.0,
       1.0
     );
-    vBirth = aBornAge < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aBornAge + uTime);
-    float safeJumpStart = max(0.0, aJumpStart);
-    float safeJumpEnd = max(safeJumpStart + 0.08, aJumpEnd);
+    vBirth = aLifecycleState.w < 0.0 ? 1.0 : smoothstep(0.0, 0.8, aLifecycleState.w + uTime);
+    float safeJumpStart = max(0.0, aJumpWindow.x);
+    float safeJumpEnd = max(safeJumpStart + 0.08, aJumpWindow.y);
     float jumpRise = smoothstep(safeJumpStart, safeJumpStart + 0.04, uTime);
     float jumpFallStart = max(safeJumpStart + 0.05, safeJumpEnd - 0.10);
     float jumpFall = 1.0 - smoothstep(jumpFallStart, safeJumpEnd, uTime);
-    vJumpPulse = step(0.0, aJumpStart) * jumpRise * jumpFall;
+    vJumpPulse = step(0.0, aJumpWindow.x) * jumpRise * jumpFall;
     vec4 mvPosition = modelViewMatrix * vec4(animatedPosition, 1.0);
     float twinkle = 1.0 + sin(uTime * 1.6 + animatedPosition.x * 0.07 + animatedPosition.z * 0.05) * 0.035 * vIntensity;
     float lifecycleScale = mix(1.0, 0.12, vLifecycle);
     float birthScale = mix(0.08, 1.0, vBirth);
     float jumpScale = mix(1.0, uJumpTargetScale, vJumpPulse);
-    gl_PointSize = clamp(animatedSize * lifecycleScale * birthScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 1.0, 110.0);
+    gl_PointSize = clamp(animatedSize * lifecycleScale * birthScale * jumpScale * uPixelRatio * twinkle * (260.0 / max(1.0, -mvPosition.z)), 5.5, 110.0);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -92,15 +84,15 @@ const fragmentShader = `
     if (radius > 1.0) discard;
 
     float angle = atan(p.y, p.x);
-    float fourRays = pow(abs(cos(angle * 2.0)), 18.0);
-    float eightRays = pow(abs(cos(angle * 4.0)), 34.0) * 0.42;
-    float starBoundary = 0.16 + fourRays * 0.49 + eightRays * 0.18;
-    float body = 1.0 - smoothstep(starBoundary, starBoundary + 0.075, radius);
-    float core = 1.0 - smoothstep(0.0, 0.13, radius);
-    float halo = exp(-4.8 * radius * radius) * 0.42;
+    float fourRays = pow(abs(cos(angle * 2.0)), 11.0);
+    float eightRays = pow(abs(cos(angle * 4.0)), 24.0);
+    float starBoundary = 0.13 + fourRays * 0.62 + eightRays * 0.16;
+    float body = 1.0 - smoothstep(starBoundary, starBoundary + 0.055, radius);
+    float core = 1.0 - smoothstep(0.0, 0.065, radius);
+    float halo = exp(-6.2 * radius * radius) * 0.20;
     float lifecycleVisibility = 1.0 - vLifecycle;
     float alpha = min(1.0, body + core + halo * vIntensity) * lifecycleVisibility * vBirth;
-    vec3 color = mix(vColor, vec3(1.0), core * 0.72) * lifecycleVisibility;
+    vec3 color = mix(vColor, vec3(1.0), core * 0.16) * lifecycleVisibility;
     float jumpBrightness = mix(1.0, uJumpTargetBrightness, vJumpPulse);
     gl_FragColor = vec4(color * (0.78 + core * 1.15 + halo * 0.35) * jumpBrightness, min(1.0, alpha * jumpBrightness));
   }
@@ -237,10 +229,13 @@ export class GraphScene {
       snapshot.historical === true ? 0 : 1,
     );
     this.edges = this.createEdges(this.nodes, visibleEdges, positions);
-    this.edgeCount = visibleEdges.length;
+    const byId = new Map(this.nodes.map((node) => [node.id, node]));
+    this.edgeCount = visibleEdges.filter(
+      (edge) => isPersistentVaultEdge(edge, byId) || isActivityEdge(edge),
+    ).length;
     this.scene.add(this.edges, this.points);
     this.createActivityRoutes(this.nodes, visibleEdges, positions);
-    this.onStats?.({ nodes: this.nodes.length, edges: visibleEdges.length, fps: 0 });
+    this.onStats?.({ nodes: this.nodes.length, edges: this.edgeCount, fps: 0 });
   }
 
   setTheme(theme: Partial<GraphTheme>): void {
@@ -276,10 +271,7 @@ export class GraphScene {
     const positionsFrom = geometry.getAttribute("aPositionFrom") as THREE.BufferAttribute;
     const colors = geometry.getAttribute("aNodeColor") as THREE.BufferAttribute;
     const colorsFrom = geometry.getAttribute("aNodeColorFrom") as THREE.BufferAttribute;
-    const sizes = geometry.getAttribute("aSize") as THREE.BufferAttribute;
-    const sizesFrom = geometry.getAttribute("aSizeFrom") as THREE.BufferAttribute;
-    const intensities = geometry.getAttribute("aIntensity") as THREE.BufferAttribute;
-    const intensitiesFrom = geometry.getAttribute("aIntensityFrom") as THREE.BufferAttribute;
+    const sizeStates = geometry.getAttribute("aSizeState") as THREE.BufferAttribute;
     const rawProgress = Math.max(
       0,
       Math.min(
@@ -302,8 +294,8 @@ export class GraphScene {
           mix(colorsFrom.getY(index), colors.getY(index)),
           mix(colorsFrom.getZ(index), colors.getZ(index)),
         ],
-        size: mix(sizesFrom.getX(index), sizes.getX(index)),
-        intensity: mix(intensitiesFrom.getX(index), intensities.getX(index)),
+        size: mix(sizeStates.getY(index), sizeStates.getX(index)),
+        intensity: mix(sizeStates.getW(index), sizeStates.getZ(index)),
       });
     });
     return visuals;
@@ -320,18 +312,10 @@ export class GraphScene {
     const positionsFrom = new Float32Array(nodes.length * 3);
     const colors = new Float32Array(nodes.length * 3);
     const colorsFrom = new Float32Array(nodes.length * 3);
-    const sizes = new Float32Array(nodes.length);
-    const sizesFrom = new Float32Array(nodes.length);
-    const intensities = new Float32Array(nodes.length);
-    const intensitiesFrom = new Float32Array(nodes.length);
-    const lifecycleAges = new Float32Array(nodes.length);
-    const lifecycleDurations = new Float32Array(nodes.length);
-    const lifecycleEligible = new Float32Array(nodes.length);
-    const bornAges = new Float32Array(nodes.length);
-    const jumpStarts = new Float32Array(nodes.length);
-    const jumpEnds = new Float32Array(nodes.length);
-    jumpStarts.fill(-1);
-    jumpEnds.fill(-1);
+    const sizeStates = new Float32Array(nodes.length * 4);
+    const lifecycleStates = new Float32Array(nodes.length * 4);
+    const jumpWindows = new Float32Array(nodes.length * 2);
+    jumpWindows.fill(-1);
     const low = new THREE.Color(this.theme.pressureLow);
     const high = new THREE.Color(this.theme.pressureHigh);
 
@@ -369,22 +353,29 @@ export class GraphScene {
         external: 5,
       };
       const baseSize = node.size ?? defaultSizes[node.kind] ?? this.theme.minNodeSize;
-      sizes[index] = baseSize * (1 + pressure * (this.theme.maxPressureScale - 1));
-      intensities[index] = node.status === "active" ? 1.2 : 0.72;
+      const size = baseSize * (1 + pressure * (this.theme.maxPressureScale - 1));
+      const intensity = node.status === "active" ? 1.2 : 0.72;
       const previous = previousVisuals?.get(node.id);
       const hasPreviousScene = previousVisuals !== null;
       positionsFrom.set(previous?.position || [x, y, z], index * 3);
       colorsFrom.set(previous?.color || [color.r, color.g, color.b], index * 3);
-      sizesFrom[index] = previous?.size ?? (hasPreviousScene ? sizes[index] * 0.12 : sizes[index]);
-      intensitiesFrom[index] = previous?.intensity ?? (hasPreviousScene ? 0 : intensities[index]);
+      const sizeFrom = previous?.size ?? (hasPreviousScene ? size * 0.12 : size);
+      const intensityFrom = previous?.intensity ?? (hasPreviousScene ? 0 : intensity);
+      sizeStates.set([size, sizeFrom, intensity, intensityFrom], index * 4);
       const lifecycleVisual = lifecycle.get(node.id);
-      lifecycleAges[index] = lifecycleVisual?.age ?? 0;
-      lifecycleDurations[index] = lifecycleVisual?.duration ?? 1;
-      lifecycleEligible[index] = lifecycleVisual ? 1 : 0;
       const createdAt = Number(node.metadata?.createdAt || 0);
-      bornAges[index] = ["result", "artifact", "skill"].includes(node.kind) && createdAt
+      const bornAge = ["result", "artifact", "skill"].includes(node.kind) && createdAt
         ? Math.max(0, Date.now() / 1000 - createdAt)
         : -1;
+      lifecycleStates.set(
+        [
+          lifecycleVisual?.age ?? 0,
+          lifecycleVisual?.duration ?? 1,
+          lifecycleVisual ? 1 : 0,
+          bornAge,
+        ],
+        index * 4,
+      );
     });
 
     const geometry = new THREE.BufferGeometry();
@@ -392,16 +383,9 @@ export class GraphScene {
     geometry.setAttribute("aPositionFrom", new THREE.BufferAttribute(positionsFrom, 3));
     geometry.setAttribute("aNodeColor", new THREE.BufferAttribute(colors, 3));
     geometry.setAttribute("aNodeColorFrom", new THREE.BufferAttribute(colorsFrom, 3));
-    geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
-    geometry.setAttribute("aSizeFrom", new THREE.BufferAttribute(sizesFrom, 1));
-    geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
-    geometry.setAttribute("aIntensityFrom", new THREE.BufferAttribute(intensitiesFrom, 1));
-    geometry.setAttribute("aLifecycleAge", new THREE.BufferAttribute(lifecycleAges, 1));
-    geometry.setAttribute("aLifecycleDuration", new THREE.BufferAttribute(lifecycleDurations, 1));
-    geometry.setAttribute("aLifecycleEligible", new THREE.BufferAttribute(lifecycleEligible, 1));
-    geometry.setAttribute("aBornAge", new THREE.BufferAttribute(bornAges, 1));
-    geometry.setAttribute("aJumpStart", new THREE.BufferAttribute(jumpStarts, 1));
-    geometry.setAttribute("aJumpEnd", new THREE.BufferAttribute(jumpEnds, 1));
+    geometry.setAttribute("aSizeState", new THREE.BufferAttribute(sizeStates, 4));
+    geometry.setAttribute("aLifecycleState", new THREE.BufferAttribute(lifecycleStates, 4));
+    geometry.setAttribute("aJumpWindow", new THREE.BufferAttribute(jumpWindows, 2));
     geometry.computeBoundingSphere();
 
     const material = new THREE.ShaderMaterial({
@@ -418,10 +402,15 @@ export class GraphScene {
       },
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      blending: THREE.NormalBlending,
+      toneMapped: false,
       vertexColors: true,
     });
-    return new THREE.Points(geometry, material);
+    const points = new THREE.Points(geometry, material);
+    points.frustumCulled = false;
+    points.renderOrder = 2;
+    return points;
   }
 
   private createEdges(
@@ -430,10 +419,10 @@ export class GraphScene {
     nodePositions: Map<string, Position>,
   ): LineSegments2 {
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]));
+    const byId = new Map(nodes.map((node) => [node.id, node]));
     const validEdges = edges.filter(
       (edge) =>
-        edge.active !== false &&
-        !JUMP_EDGE_KINDS.has(edge.kind) &&
+        isPersistentVaultEdge(edge, byId) &&
         nodeIndex.has(edge.source) &&
         nodeIndex.has(edge.target),
     );
@@ -464,7 +453,9 @@ export class GraphScene {
       Math.max(1, this.canvas.clientWidth),
       Math.max(1, this.canvas.clientHeight),
     );
-    return new LineSegments2(geometry, material);
+    const lines = new LineSegments2(geometry, material);
+    lines.renderOrder = 1;
+    return lines;
   }
 
   private createActivityRoutes(
@@ -479,7 +470,7 @@ export class GraphScene {
       .map((node) => ({ id: node.id, position: positions.get(node.id)! }));
     const activityEdges = edges
       .filter((edge) => {
-        if (!JUMP_EDGE_KINDS.has(edge.kind)) return false;
+        if (!isActivityEdge(edge)) return false;
         const source = byId.get(edge.source);
         const target = byId.get(edge.target);
         // Expiry is authoritative in the SQLite projection. This filter only
@@ -601,18 +592,17 @@ export class GraphScene {
   ): void {
     const index = nodeIndex.get(nodeId);
     if (index === undefined || !this.points) return;
-    const startAttribute = this.points.geometry.getAttribute(
-      "aJumpStart",
+    const jumpWindow = this.points.geometry.getAttribute(
+      "aJumpWindow",
     ) as THREE.BufferAttribute;
-    const endAttribute = this.points.geometry.getAttribute(
-      "aJumpEnd",
-    ) as THREE.BufferAttribute;
-    const currentStart = startAttribute.getX(index);
-    const currentEnd = endAttribute.getX(index);
-    startAttribute.setX(index, currentStart < 0 ? start : Math.min(currentStart, start));
-    endAttribute.setX(index, Math.max(currentEnd, end));
-    startAttribute.needsUpdate = true;
-    endAttribute.needsUpdate = true;
+    const currentStart = jumpWindow.getX(index);
+    const currentEnd = jumpWindow.getY(index);
+    jumpWindow.setXY(
+      index,
+      currentStart < 0 ? start : Math.min(currentStart, start),
+      Math.max(currentEnd, end),
+    );
+    jumpWindow.needsUpdate = true;
   }
 
   private buildBeautifulRoute(
@@ -776,7 +766,6 @@ export class GraphScene {
     if (material?.uniforms.uTime) material.uniforms.uTime.value = elapsedTime;
     this.updateActivityRoutes(elapsedTime);
     this.renderer.render(this.scene, this.camera);
-
     this.frameCount += 1;
     const now = performance.now();
     if (now - this.frameWindowStart >= 1000) {
