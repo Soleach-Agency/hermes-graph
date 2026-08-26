@@ -32,4 +32,35 @@ describe("runtime layout boundary", () => {
       expect(Math.hypot(...position)).toBeGreaterThanOrEqual(196.999);
     }
   });
+
+  it("keeps existing runtime nodes fixed when a new task takes an open position", () => {
+    const initialNodes: SceneNode[] = [
+      { id: "session:1", kind: "session", label: "Session" },
+      { id: "task:1", kind: "task", label: "First task" },
+      { id: "agent:1", kind: "agent", label: "Agent" },
+    ];
+    const edges: SceneEdge[] = [
+      { id: "belongs", source: "agent:1", target: "session:1", kind: "belongs_to" },
+      { id: "assigned", source: "task:1", target: "agent:1", kind: "assigned_to" },
+    ];
+    const initial = computeSpatialLayout(initialNodes, edges, {
+      vaultRadius: 155,
+      runtimeOrbitRadius: 255,
+    });
+    const nextNodes = [
+      ...initialNodes,
+      { id: "task:2", kind: "task", label: "New task" } satisfies SceneNode,
+    ];
+    const next = computeSpatialLayout(nextNodes, edges, {
+      vaultRadius: 155,
+      runtimeOrbitRadius: 255,
+      previousPositions: initial,
+    });
+
+    for (const node of initialNodes) {
+      expect(next.get(node.id)).toEqual(initial.get(node.id));
+    }
+    expect(next.get("task:2")).toBeDefined();
+    expect(next.get("task:2")).not.toEqual(initial.get("task:1"));
+  });
 });

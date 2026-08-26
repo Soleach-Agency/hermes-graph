@@ -1,5 +1,6 @@
 import { createDemoSnapshot, DEMO_TIMELINE_CURSOR } from "./demo";
 import { GraphScene } from "./GraphScene";
+import { interpolatePlaybackCursor } from "./timeline";
 import {
   DEFAULT_THEME,
   DEFAULT_TOOL_RULES,
@@ -126,7 +127,11 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const liveRef = React.useRef(true);
     const demoCountRef = React.useRef(10_000);
     const playbackStartRef = React.useRef(0);
+    const playbackEndRef = React.useRef(0);
     const playbackLoadingRef = React.useRef(false);
+    const snapshotRequestRef = React.useRef(0);
+    const seekTimerRef = React.useRef(0);
+    const seekCursorRef = React.useRef(0);
     const initialPreferencesRef = React.useRef<GraphPreferences>(loadLocalPreferences());
     const [hover, setHover] = React.useState<HoverState>(null);
     const [stats, setStats] = React.useState<Stats>({ nodes: 0, edges: 0, fps: 0 });
@@ -163,12 +168,14 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       [],
     );
 
-    const loadSnapshot = React.useCallback(async (at?: number) => {
+    const loadSnapshot = React.useCallback(async (at?: number, updateView = true) => {
+      const requestId = ++snapshotRequestRef.current;
       try {
         const suffix = at === undefined ? "" : `?at=${Math.max(0, Math.round(at))}`;
         const snapshot = await fetchJSON<SceneSnapshot>(
           `/api/plugins/hermes-graph/snapshot${suffix}`,
         );
+        if (requestId !== snapshotRequestRef.current) return;
         if (at === undefined) {
           cursorRef.current = snapshot.cursor;
           setMaxCursor(snapshot.cursor);
@@ -176,7 +183,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           setIsLive(true);
           liveRef.current = true;
         } else {
-          setViewCursor(snapshot.cursor);
+          if (updateView) setViewCursor(snapshot.cursor);
           setIsLive(false);
           liveRef.current = false;
         }
@@ -192,6 +199,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         ])).sort((left, right) => left.localeCompare(right)));
         setConnection("LIVE");
       } catch (error) {
+        if (requestId !== snapshotRequestRef.current) return;
         if (options.demoOnEmpty) {
           showDemoFrame(10_000);
           setConnection("DEMO");
@@ -269,6 +277,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         disposed = true;
         window.clearTimeout(reconnectTimer);
         window.clearTimeout(pollTimer);
+        window.clearTimeout(seekTimerRef.current);
         socket?.close();
         scene.dispose();
         sceneRef.current = null;
@@ -309,34 +318,65 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     }, []);
 
     React.useEffect(() => {
-      if (!playing || maxCursor <= 0) return;
-      const tickMs = stats.nodes >= 40_000 ? 650 : stats.nodes >= 20_000 ? 450 : 300;
-      const playbackSteps = Math.max(24, Math.round(24_000 / tickMs));
-      const timer = window.setInterval(() => {
-        setViewCursor((current) => {
-          const step = Math.max(
-            1,
-            Math.ceil((maxCursor - playbackStartRef.current) / playbackSteps),
-          );
-          const next = Math.min(maxCursor, current + step);
+      if (!playing) return;
+      const startCursor = playbackStartRef.current;
+      const endCursor = playbackEndRef.current;
+      if (endCursor <= startCursor) {
+        setPlaying(false);
+        return;
+      }
+      const snapshotCadenceMs =
+        stats.nodes >= 40_000 ? 620 : stats.nodes >= 20_000 ? 430 : 260;
+      const transitionSeconds =
+        stats.nodes >= 40_000 ? 1.8 : stats.nodes >= 20_000 ? 1.5 : 1.2;
+      sceneRef.current?.setTransitionDuration(transitionSeconds);
+      const startedAt = performance.now();
+      const durationMs = 24_000;
+      let lastSnapshotAt = -snapshotCadenceMs;
+      let frame = 0;
+      let disposed = false;
+
+      const tick = (now: number) => {
+        if (disposed) return;
+        const elapsed = now - startedAt;
+        const progress = Math.min(1, Math.max(0, elapsed / durationMs));
+        const next = interpolatePlaybackCursor(
+          startCursor,
+          endCursor,
+          elapsed,
+          durationMs,
+        );
+        setViewCursor(next);
+        setIsLive(false);
+        liveRef.current = false;
+
+        if (now - lastSnapshotAt >= snapshotCadenceMs && !playbackLoadingRef.current) {
+          lastSnapshotAt = now;
           if (isDemo) {
             sceneRef.current?.setSnapshot(createDemoSnapshot(demoCountRef.current, next));
-            const atLiveEdge = next >= maxCursor;
-            setIsLive(atLiveEdge);
-            liveRef.current = atLiveEdge;
           } else {
-            if (playbackLoadingRef.current) return current;
             playbackLoadingRef.current = true;
-            void loadSnapshot(next >= maxCursor ? undefined : next).finally(() => {
+            void loadSnapshot(next, false).finally(() => {
               playbackLoadingRef.current = false;
             });
           }
-          if (next >= maxCursor) setPlaying(false);
-          return next;
-        });
-      }, tickMs);
-      return () => window.clearInterval(timer);
-    }, [playing, isDemo, maxCursor, loadSnapshot, stats.nodes]);
+        }
+
+        if (progress >= 1) {
+          sceneRef.current?.setTransitionDuration(0.72);
+          setPlaying(false);
+          if (isDemo) showDemoFrame(demoCountRef.current, endCursor, true);
+          else void loadSnapshot();
+          return;
+        }
+        frame = window.requestAnimationFrame(tick);
+      };
+      frame = window.requestAnimationFrame(tick);
+      return () => {
+        disposed = true;
+        window.cancelAnimationFrame(frame);
+      };
+    }, [playing, isDemo, loadSnapshot, showDemoFrame]);
 
     const showDemo = (count: number) => {
       const started = performance.now();
@@ -345,21 +385,35 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       setConnection(`DEMO ${Math.round(performance.now() - started)}MS`);
     };
 
-    const seek = (cursor: number) => {
-      setPlaying(false);
+    const commitSeek = (cursor = seekCursorRef.current) => {
+      window.clearTimeout(seekTimerRef.current);
       if (isDemo) {
-        showDemoFrame(demoCountRef.current, cursor, cursor >= maxCursor);
+        sceneRef.current?.setSnapshot(createDemoSnapshot(demoCountRef.current, cursor));
         return;
       }
-      if (cursor >= maxCursor) {
-        void loadSnapshot();
-      } else {
-        void loadSnapshot(cursor);
-      }
+      void loadSnapshot(cursor >= maxCursor ? undefined : cursor);
+    };
+
+    const seek = (cursor: number, immediate = false) => {
+      const next = Math.max(0, Math.min(maxCursor, Math.round(cursor)));
+      setPlaying(false);
+      sceneRef.current?.setTransitionDuration(0.24);
+      snapshotRequestRef.current += 1;
+      seekCursorRef.current = next;
+      setViewCursor(next);
+      const atLiveEdge = next >= maxCursor;
+      setIsLive(atLiveEdge);
+      liveRef.current = atLiveEdge;
+      window.clearTimeout(seekTimerRef.current);
+      if (immediate) commitSeek(next);
+      else seekTimerRef.current = window.setTimeout(() => commitSeek(next), 80);
     };
 
     const returnLive = () => {
       setPlaying(false);
+      window.clearTimeout(seekTimerRef.current);
+      snapshotRequestRef.current += 1;
+      sceneRef.current?.setTransitionDuration(0.72);
       if (isDemo) showDemoFrame(demoCountRef.current);
       else void loadSnapshot();
     };
@@ -367,12 +421,20 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const togglePlayback = async () => {
       if (playing) {
         setPlaying(false);
+        snapshotRequestRef.current += 1;
+        sceneRef.current?.setTransitionDuration(0.24);
+        commitSeek(viewCursor);
         return;
       }
       if (maxCursor <= 0) return;
+      window.clearTimeout(seekTimerRef.current);
+      snapshotRequestRef.current += 1;
+      setIsLive(false);
+      liveRef.current = false;
 
       if (!isLive && viewCursor < maxCursor) {
         playbackStartRef.current = viewCursor;
+        playbackEndRef.current = maxCursor;
         setPlaying(true);
         return;
       }
@@ -386,6 +448,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
             : Math.ceil(selected.seconds / 60);
         startCursor = Math.max(0, DEMO_TIMELINE_CURSOR - cursorSpan);
         showDemoFrame(demoCountRef.current, startCursor, false);
+        playbackEndRef.current = DEMO_TIMELINE_CURSOR;
       } else {
         const query = selected.seconds === null ? "" : `?seconds=${selected.seconds}`;
         const range = await fetchJSON<TimelineRange>(
@@ -394,9 +457,10 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         startCursor = range.startCursor;
         if (range.endCursor <= startCursor) return;
         await loadSnapshot(startCursor);
+        playbackEndRef.current = range.endCursor;
       }
       playbackStartRef.current = startCursor;
-      setPlaying(startCursor < maxCursor);
+      setPlaying(startCursor < playbackEndRef.current);
     };
 
     const previewTheme = (next: GraphTheme) => {
@@ -987,7 +1051,9 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           value: isLive ? maxCursor : viewCursor,
           disabled: maxCursor <= 0,
           "aria-label": "Timeline cursor",
-          onChange: (event: Event) => seek(Number((event.target as HTMLInputElement).value)),
+          onInput: (event: Event) => seek(Number((event.target as HTMLInputElement).value)),
+          onPointerUp: () => commitSeek(),
+          onKeyUp: () => commitSeek(),
         }),
         h(
           "button",

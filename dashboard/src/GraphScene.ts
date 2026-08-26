@@ -143,7 +143,7 @@ export class GraphScene {
   private edgeCount = 0;
   private readonly jumpTexture = this.createJumpTexture();
   private transitionStartedAt = 0;
-  private readonly transitionDuration = 0.72;
+  private transitionDuration = 0.72;
   private nodes: SceneNode[] = [];
   private snapshot: SceneSnapshot | null = null;
   private activeRoutes: ActiveRoute[] = [];
@@ -215,9 +215,15 @@ export class GraphScene {
     const visibleEdges = snapshot.edges.filter(
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     );
+    const previousPositions = previousVisuals
+      ? new Map(
+          Array.from(previousVisuals, ([id, visual]) => [id, visual.position] as const),
+        )
+      : undefined;
     const positions = computeSpatialLayout(this.nodes, visibleEdges, {
       vaultRadius: this.theme.vaultRadius,
       runtimeOrbitRadius: this.theme.runtimeOrbitRadius,
+      previousPositions,
     });
     this.disposeGraph();
     this.transitionStartedAt = this.clock.elapsedTime;
@@ -250,6 +256,10 @@ export class GraphScene {
       this.scene.fog.color.set(this.theme.background);
     }
     if (this.snapshot) this.setSnapshot(this.snapshot);
+  }
+
+  setTransitionDuration(seconds: number): void {
+    this.transitionDuration = Math.max(0.08, Math.min(3, seconds));
   }
 
   dispose(): void {
