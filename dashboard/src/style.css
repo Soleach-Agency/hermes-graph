@@ -472,6 +472,57 @@ body,
   cursor: pointer;
 }
 
+.hg-playback-speed {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 5px;
+  border: 1px solid rgba(145, 132, 230, 0.16);
+  border-radius: 5px;
+  background: rgba(118, 92, 211, 0.045);
+}
+
+.hg-playback-mode,
+.hg-playback-unit,
+.hg-playback-value {
+  appearance: none;
+  border: 0;
+  color: rgba(206, 214, 239, 0.72);
+  background: transparent;
+  font: 8px/1 "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.045em;
+}
+
+.hg-playback-mode {
+  width: 67px;
+  cursor: pointer;
+}
+
+.hg-playback-value {
+  width: 39px;
+  padding: 2px 3px;
+  border-bottom: 1px solid rgba(159, 83, 255, 0.36);
+  outline: 0;
+  text-align: right;
+}
+
+.hg-playback-unit {
+  width: 38px;
+  cursor: pointer;
+}
+
+.hg-playback-equals {
+  color: rgba(181, 164, 255, 0.4);
+}
+
+.hg-playback-mode:disabled,
+.hg-playback-unit:disabled,
+.hg-playback-value:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
 .hg-play:disabled {
   cursor: default;
   opacity: 0.35;

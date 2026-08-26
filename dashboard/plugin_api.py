@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +38,12 @@ resume_configured_vault_watcher()
 router = APIRouter()
 
 
+def _model_payload(model: BaseModel) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
 class VaultConfiguration(BaseModel):
     path: str
 
@@ -48,9 +54,25 @@ class ToolRoutingRule(BaseModel):
     referenceField: str = ""
 
 
+class PlaybackDurationSetting(BaseModel):
+    value: float = Field(default=1, ge=0.1, le=1000)
+    unit: Literal["seconds", "minutes", "hours"] = "seconds"
+
+
+class PlaybackPreferences(BaseModel):
+    mode: Literal["fixed-duration", "per-source-hour"] = "fixed-duration"
+    fixedDuration: PlaybackDurationSetting = Field(
+        default_factory=lambda: PlaybackDurationSetting(value=24)
+    )
+    perSourceHour: PlaybackDurationSetting = Field(
+        default_factory=PlaybackDurationSetting
+    )
+
+
 class GraphPreferences(BaseModel):
     theme: dict[str, Any]
     toolRules: list[ToolRoutingRule]
+    playback: PlaybackPreferences = Field(default_factory=PlaybackPreferences)
 
 
 @router.get("/snapshot")
@@ -91,7 +113,11 @@ async def settings():
     return await asyncio.to_thread(
         get_setting,
         "graph_preferences",
-        {"theme": {}, "toolRules": []},
+        {
+            "theme": {},
+            "toolRules": [],
+            "playback": _model_payload(PlaybackPreferences()),
+        },
     )
 
 
@@ -111,7 +137,11 @@ async def save_settings(preferences: GraphPreferences):
                 "referenceField": rule.referenceField.strip()[:100],
             }
         )
-    value = {"theme": preferences.theme, "toolRules": rules}
+    value = {
+        "theme": preferences.theme,
+        "toolRules": rules,
+        "playback": _model_payload(preferences.playback),
+    }
     await asyncio.to_thread(set_setting, "graph_preferences", value)
     return value
 

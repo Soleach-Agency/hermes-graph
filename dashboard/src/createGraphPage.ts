@@ -1,11 +1,16 @@
 import { createDemoSnapshot, DEMO_TIMELINE_CURSOR } from "./demo";
 import { GraphScene } from "./GraphScene";
-import { interpolatePlaybackCursor } from "./timeline";
+import { interpolatePlaybackCursor, resolvePlaybackDurationMs } from "./timeline";
 import {
+  DEFAULT_PLAYBACK,
   DEFAULT_THEME,
   DEFAULT_TOOL_RULES,
   type GraphPreferences,
   type GraphTheme,
+  type PlaybackDurationSetting,
+  type PlaybackDurationUnit,
+  type PlaybackMode,
+  type PlaybackPreferences,
   type SceneNode,
   type SceneSnapshot,
   type ToolRoutingRule,
@@ -93,19 +98,52 @@ function mergeTheme(saved?: Partial<GraphTheme> | null): GraphTheme {
   };
 }
 
+function mergeDurationSetting(
+  saved: Partial<PlaybackDurationSetting> | null | undefined,
+  fallback: PlaybackDurationSetting,
+): PlaybackDurationSetting {
+  const units: PlaybackDurationUnit[] = ["seconds", "minutes", "hours"];
+  const value = Number(saved?.value);
+  return {
+    value: Number.isFinite(value) ? Math.max(0.1, Math.min(1000, value)) : fallback.value,
+    unit: units.includes(saved?.unit as PlaybackDurationUnit)
+      ? (saved?.unit as PlaybackDurationUnit)
+      : fallback.unit,
+  };
+}
+
+function mergePlayback(saved?: Partial<PlaybackPreferences> | null): PlaybackPreferences {
+  return {
+    mode: saved?.mode === "per-source-hour" ? "per-source-hour" : "fixed-duration",
+    fixedDuration: mergeDurationSetting(
+      saved?.fixedDuration,
+      DEFAULT_PLAYBACK.fixedDuration,
+    ),
+    perSourceHour: mergeDurationSetting(
+      saved?.perSourceHour,
+      DEFAULT_PLAYBACK.perSourceHour,
+    ),
+  };
+}
+
 function loadLocalPreferences(): GraphPreferences {
   try {
     const saved = JSON.parse(localStorage.getItem("hermes-graph:theme") || "null") as
       | Partial<GraphTheme>
       | null;
+    const playback = JSON.parse(
+      localStorage.getItem("hermes-graph:playback") || "null",
+    ) as Partial<PlaybackPreferences> | null;
     return {
       theme: mergeTheme(saved),
       toolRules: [...DEFAULT_TOOL_RULES],
+      playback: mergePlayback(playback),
     };
   } catch {
     return {
       theme: mergeTheme(),
       toolRules: [...DEFAULT_TOOL_RULES],
+      playback: mergePlayback(),
     };
   }
 }
@@ -128,6 +166,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const demoCountRef = React.useRef(10_000);
     const playbackStartRef = React.useRef(0);
     const playbackEndRef = React.useRef(0);
+    const playbackDurationMsRef = React.useRef(24_000);
     const playbackLoadingRef = React.useRef(false);
     const snapshotRequestRef = React.useRef(0);
     const seekTimerRef = React.useRef(0);
@@ -144,6 +183,9 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
     const [theme, setTheme] = React.useState(initialPreferencesRef.current.theme);
     const [toolRules, setToolRules] = React.useState<ToolRoutingRule[]>(
       initialPreferencesRef.current.toolRules,
+    );
+    const [playback, setPlayback] = React.useState<PlaybackPreferences>(
+      initialPreferencesRef.current.playback,
     );
     const [knownTools, setKnownTools] = React.useState<string[]>([]);
     const [settingsBusy, setSettingsBusy] = React.useState(false);
@@ -198,6 +240,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           ...snapshot.nodes.filter((node) => node.kind === "tool").map((node) => node.label),
         ])).sort((left, right) => left.localeCompare(right)));
         setConnection("LIVE");
+        return snapshot;
       } catch (error) {
         if (requestId !== snapshotRequestRef.current) return;
         if (options.demoOnEmpty) {
@@ -296,8 +339,10 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           }
           const nextTheme = mergeTheme(saved.theme);
           const nextRules = Array.isArray(saved.toolRules) ? saved.toolRules : [];
+          const nextPlayback = mergePlayback(saved.playback);
           setTheme(nextTheme);
           setToolRules(nextRules);
+          setPlayback(nextPlayback);
           sceneRef.current?.setTheme(nextTheme);
           setSettingsMessage("SAVED ON SERVER");
         })
@@ -331,7 +376,7 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         stats.nodes >= 40_000 ? 1.8 : stats.nodes >= 20_000 ? 1.5 : 1.2;
       sceneRef.current?.setTransitionDuration(transitionSeconds);
       const startedAt = performance.now();
-      const durationMs = 24_000;
+      const durationMs = playbackDurationMsRef.current;
       let lastSnapshotAt = -snapshotCadenceMs;
       let frame = 0;
       let disposed = false;
@@ -418,6 +463,17 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       else void loadSnapshot();
     };
 
+    const beginPlayback = (
+      startCursor: number,
+      endCursor: number,
+      sourceSeconds: number,
+    ) => {
+      playbackStartRef.current = startCursor;
+      playbackEndRef.current = endCursor;
+      playbackDurationMsRef.current = resolvePlaybackDurationMs(playback, sourceSeconds);
+      setPlaying(startCursor < endCursor);
+    };
+
     const togglePlayback = async () => {
       if (playing) {
         setPlaying(false);
@@ -433,9 +489,17 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       liveRef.current = false;
 
       if (!isLive && viewCursor < maxCursor) {
-        playbackStartRef.current = viewCursor;
-        playbackEndRef.current = maxCursor;
-        setPlaying(true);
+        if (isDemo) {
+          beginPlayback(viewCursor, maxCursor, (maxCursor - viewCursor) * 60);
+          return;
+        }
+        const [range, startSnapshot] = await Promise.all([
+          fetchJSON<TimelineRange>("/api/plugins/hermes-graph/timeline/range"),
+          loadSnapshot(viewCursor, false),
+        ]);
+        const sourceStartAt = Number(startSnapshot?.asOf || 0) || range.startAt || 0;
+        const sourceSeconds = Math.max(1, Number(range.endAt || 0) - sourceStartAt);
+        beginPlayback(viewCursor, range.endCursor, sourceSeconds);
         return;
       }
 
@@ -448,7 +512,11 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
             : Math.ceil(selected.seconds / 60);
         startCursor = Math.max(0, DEMO_TIMELINE_CURSOR - cursorSpan);
         showDemoFrame(demoCountRef.current, startCursor, false);
-        playbackEndRef.current = DEMO_TIMELINE_CURSOR;
+        beginPlayback(
+          startCursor,
+          DEMO_TIMELINE_CURSOR,
+          (DEMO_TIMELINE_CURSOR - startCursor) * 60,
+        );
       } else {
         const query = selected.seconds === null ? "" : `?seconds=${selected.seconds}`;
         const range = await fetchJSON<TimelineRange>(
@@ -457,10 +525,28 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         startCursor = range.startCursor;
         if (range.endCursor <= startCursor) return;
         await loadSnapshot(startCursor);
-        playbackEndRef.current = range.endCursor;
+        beginPlayback(
+          startCursor,
+          range.endCursor,
+          Math.max(1, Number(range.endAt || 0) - Number(range.startAt || 0)),
+        );
       }
-      playbackStartRef.current = startCursor;
-      setPlaying(startCursor < playbackEndRef.current);
+    };
+
+    const updatePlaybackMode = (mode: PlaybackMode) => {
+      setPlayback((current) => ({ ...current, mode }));
+      setSettingsMessage("UNSAVED CHANGES");
+    };
+
+    const updatePlaybackDuration = (patch: Partial<PlaybackDurationSetting>) => {
+      setPlayback((current) => {
+        const key = current.mode === "fixed-duration" ? "fixedDuration" : "perSourceHour";
+        return {
+          ...current,
+          [key]: mergeDurationSetting({ ...current[key], ...patch }, current[key]),
+        };
+      });
+      setSettingsMessage("UNSAVED CHANGES");
     };
 
     const previewTheme = (next: GraphTheme) => {
@@ -531,12 +617,15 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
         const saved = await fetchJSON<GraphPreferences>("/api/plugins/hermes-graph/settings", {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ theme, toolRules }),
+          body: JSON.stringify({ theme, toolRules, playback }),
         });
         const nextTheme = mergeTheme(saved.theme);
+        const nextPlayback = mergePlayback(saved.playback);
         setTheme(nextTheme);
         setToolRules(saved.toolRules || []);
+        setPlayback(nextPlayback);
         localStorage.setItem("hermes-graph:theme", JSON.stringify(nextTheme));
+        localStorage.setItem("hermes-graph:playback", JSON.stringify(nextPlayback));
         sceneRef.current?.setTheme(nextTheme);
         setSettingsMessage("SAVED ON SERVER");
       } catch (error) {
@@ -551,6 +640,9 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
       ...knownTools,
       ...toolRules.map((rule) => rule.tool).filter(Boolean),
     ])).sort((left, right) => left.localeCompare(right));
+    const activePlaybackDuration = playback.mode === "fixed-duration"
+      ? playback.fixedDuration
+      : playback.perSourceHour;
     return h(
       "div",
       { className: "hg-root" },
@@ -1041,6 +1133,61 @@ export function createGraphPage(React: ReactApi, options: PageOptions = {}) {
           },
           ...PLAYBACK_WINDOWS.map((window) =>
             h("option", { key: window.key, value: window.key }, window.label),
+          ),
+        ),
+        h(
+          "div",
+          {
+            className: "hg-playback-speed",
+            title: playback.mode === "fixed-duration"
+              ? "Play every selected window in this total real duration"
+              : "Real duration used for each source-time hour",
+          },
+          h(
+            "select",
+            {
+              className: "hg-playback-mode",
+              value: playback.mode,
+              disabled: playing,
+              "aria-label": "Playback speed mode",
+              onChange: (event: Event) =>
+                updatePlaybackMode(
+                  (event.target as HTMLSelectElement).value as PlaybackMode,
+                ),
+            },
+            h("option", { value: "fixed-duration" }, "TOTAL"),
+            h("option", { value: "per-source-hour" }, "1H SOURCE"),
+          ),
+          h("span", { className: "hg-playback-equals" }, "="),
+          h("input", {
+            className: "hg-playback-value",
+            type: "number",
+            min: 0.1,
+            max: 1000,
+            step: 0.1,
+            value: activePlaybackDuration.value,
+            disabled: playing,
+            "aria-label": "Playback duration value",
+            onChange: (event: Event) =>
+              updatePlaybackDuration({
+                value: Number((event.target as HTMLInputElement).value),
+              }),
+          }),
+          h(
+            "select",
+            {
+              className: "hg-playback-unit",
+              value: activePlaybackDuration.unit,
+              disabled: playing,
+              "aria-label": "Playback duration unit",
+              onChange: (event: Event) =>
+                updatePlaybackDuration({
+                  unit: (event.target as HTMLSelectElement).value as PlaybackDurationUnit,
+                }),
+            },
+            h("option", { value: "seconds" }, "SEC"),
+            h("option", { value: "minutes" }, "MIN"),
+            h("option", { value: "hours" }, "HOUR"),
           ),
         ),
         h("input", {

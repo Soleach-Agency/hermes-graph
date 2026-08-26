@@ -53,6 +53,21 @@ export interface ToolRoutingRule {
 export interface GraphPreferences {
   theme: GraphTheme;
   toolRules: ToolRoutingRule[];
+  playback: PlaybackPreferences;
+}
+
+export type PlaybackMode = "fixed-duration" | "per-source-hour";
+export type PlaybackDurationUnit = "seconds" | "minutes" | "hours";
+
+export interface PlaybackDurationSetting {
+  value: number;
+  unit: PlaybackDurationUnit;
+}
+
+export interface PlaybackPreferences {
+  mode: PlaybackMode;
+  fixedDuration: PlaybackDurationSetting;
+  perSourceHour: PlaybackDurationSetting;
 }
 
 export interface GraphTheme {
@@ -122,3 +137,9 @@ export const DEFAULT_THEME: GraphTheme = {
 };
 
 export const DEFAULT_TOOL_RULES: ToolRoutingRule[] = [];
+
+export const DEFAULT_PLAYBACK: PlaybackPreferences = {
+  mode: "fixed-duration",
+  fixedDuration: { value: 24, unit: "seconds" },
+  perSourceHour: { value: 1, unit: "seconds" },
+};
